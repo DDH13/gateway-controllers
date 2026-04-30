@@ -376,6 +376,8 @@ class GraniteGuardianPolicyTest(unittest.TestCase):
             call_count += 1
             return resp
 
+        original_post = sys.modules["requests"].post
+        self.addCleanup(setattr, sys.modules["requests"], "post", original_post)
         sys.modules["requests"].post = fake_post
 
         instance = self._make_policy()
@@ -387,8 +389,6 @@ class GraniteGuardianPolicyTest(unittest.TestCase):
 
         self.assertIsInstance(result, ImmediateResponse)
         self.assertEqual(2, len(FakeRequests.post_calls))
-
-        sys.modules["requests"].post = FakeRequests.post
 
     # --- error handling ---
 
@@ -481,6 +481,63 @@ class GraniteGuardianPolicyTest(unittest.TestCase):
 
         system_msg = FakeRequests.post_calls[0]["json"]["messages"][0]
         self.assertIn("prompt_injection", system_msg["content"])
+
+    # --- confidence / threshold edge cases ---
+
+    def test_passes_through_when_logprob_is_missing(self) -> None:
+        # Guardian returns "Yes" but no logprobs — missing confidence must not block.
+        response = FakeHTTPResponse({
+            "choices": [{
+                "message": {"content": "<score> Yes </score>"},
+                "logprobs": {"content": []},
+            }]
+        })
+        FakeRequests.reset(response=response)
+        instance = self._make_policy()
+
+        result = instance.on_request_body(
+            None,
+            request_context({"messages": [{"content": "attack"}]}),
+            {"riskNames": ["jailbreak"], "threshold": 0.5},
+        )
+
+        self.assertIsNone(result)
+
+    # --- bool coercion ---
+
+    def test_passthrough_on_error_string_false_is_falsy(self) -> None:
+        FakeRequests.reset(error=ConnectionError("down"))
+        instance = self._make_policy()
+
+        result = instance.on_request_body(
+            None,
+            request_context({"messages": [{"content": "hello"}]}),
+            {"riskNames": ["jailbreak"], "passthroughOnError": "false"},
+        )
+
+        self.assertIsInstance(result, ImmediateResponse)
+        self.assertEqual(503, result.status_code)
+
+    def test_show_assessment_string_true_is_truthy(self) -> None:
+        FakeRequests.reset(response=guardian_response("Yes", confidence=0.9))
+        instance = self._make_policy()
+
+        result = instance.on_request_body(
+            None,
+            request_context({"messages": [{"content": "attack"}]}),
+            {"riskNames": ["jailbreak"], "threshold": 0.0, "showAssessment": "true"},
+        )
+
+        body = json.loads(result.body)
+        self.assertIn("assessments", body["message"])
+
+    # --- malformed JSONPath ---
+
+    def test_resolve_jsonpath_returns_none_for_unclosed_bracket(self) -> None:
+        self.assertIsNone(policy._resolve_jsonpath({"messages": [{"content": "x"}]}, "$.messages[0.content"))
+
+    def test_returns_none_when_jsonpath_has_non_integer_index(self) -> None:
+        self.assertIsNone(policy._resolve_jsonpath({"messages": [{"content": "x"}]}, "$.messages[abc].content"))
 
 
 if __name__ == "__main__":

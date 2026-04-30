@@ -172,7 +172,9 @@ class GraniteGuardianPromptInjectionPolicy(RequestPolicy):
                 .get("content", [])
             )
             confidence = _verdict_confidence(logprobs_content, verdict_word.split()[0])
-            if confidence is not None and confidence < threshold:
+            # Treat missing confidence as non-blocking: if the backend didn't
+            # return a logprob we cannot verify the threshold is met.
+            if confidence is None or confidence < threshold:
                 blocked = False
 
         assessment: dict = {"risk_name": risk_name, "verdict": verdict_word}
@@ -232,8 +234,8 @@ def normalize_request_params(params: dict[str, Any] | None) -> RequestParams:
 
     threshold = _coerce_float_clamped(params.get("threshold", 0.5), lo=0.0, hi=1.0, default=0.5)
     block_status_code = _coerce_int_in_range(params.get("blockStatusCode", 400), lo=400, hi=599, default=400)
-    passthrough_on_error = bool(params.get("passthroughOnError", False))
-    show_assessment = bool(params.get("showAssessment", False))
+    passthrough_on_error = _coerce_bool(params.get("passthroughOnError"), default=False)
+    show_assessment = _coerce_bool(params.get("showAssessment"), default=False)
 
     return RequestParams(
         json_path=json_path,
@@ -243,6 +245,19 @@ def normalize_request_params(params: dict[str, Any] | None) -> RequestParams:
         passthrough_on_error=passthrough_on_error,
         show_assessment=show_assessment,
     )
+
+
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        if value.lower() in ("true", "1", "yes"):
+            return True
+        if value.lower() in ("false", "0", "no"):
+            return False
+    if isinstance(value, int):
+        return bool(value)
+    return default
 
 
 def _coerce_int_in_range(value: Any, lo: int, hi: int, default: int) -> int:
@@ -308,7 +323,10 @@ def _resolve_jsonpath(data: Any, path: str) -> Any:
             if buf:
                 segments.append(buf)
                 buf = ""
-            j = path.index("]", i)
+            try:
+                j = path.index("]", i)
+            except ValueError:
+                return None
             try:
                 segments.append(int(path[i + 1 : j]))
             except ValueError:

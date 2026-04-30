@@ -28,8 +28,16 @@ parameters:
         blocked if any category returns a positive verdict. Supported values:
         jailbreak, prompt_injection, violence, sexual_content, profanity,
         unethical_behavior.
+      minItems: 1
       items:
         type: string
+        enum:
+          - jailbreak
+          - prompt_injection
+          - violence
+          - sexual_content
+          - profanity
+          - unethical_behavior
       default:
         - jailbreak
         - prompt_injection
