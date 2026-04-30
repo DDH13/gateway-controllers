@@ -1503,6 +1503,9 @@ func (p *JwtAuthPolicy) handleAuthSuccessHeaders(shared *policy.SharedContext, c
 
 	for claimName, headerName := range claimMappings {
 		if claimValue, ok := claims[claimName]; ok {
+			if forwardToken && http.CanonicalHeaderKey(headerName) == canonicalOut {
+				continue
+			}
 			modifications.HeadersToSet[headerName] = claimValueToString(claimValue)
 		}
 	}
