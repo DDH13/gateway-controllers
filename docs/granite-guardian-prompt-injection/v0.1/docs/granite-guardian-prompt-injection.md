@@ -75,7 +75,7 @@ Inside the `api-platform` repository, add the policy package under `policies:` i
 
 ```yaml
 - name: granite-guardian-prompt-injection
-  pipPackage: github.com/wso2/gateway-controllers/policies/granite_guardian_prompt_injection@v0
+  pipPackage: github.com/wso2/gateway-controllers/policies/granite-guardian-prompt-injection@v0
 ```
 
 ## Reference Scenarios
@@ -168,7 +168,7 @@ Lower the threshold and enable assessment details to get full verdict informatio
 ```yaml
 policies:
   - name: granite-guardian-prompt-injection
-    version: v1
+    version: v0
     paths:
       - path: /chat/completions
         methods: [POST]
@@ -208,7 +208,7 @@ When the Granite Guardian service is unavailable, allow traffic to proceed rathe
 ```yaml
 policies:
   - name: granite-guardian-prompt-injection
-    version: v1
+    version: v0
     paths:
       - path: /chat/completions
         methods: [POST]
