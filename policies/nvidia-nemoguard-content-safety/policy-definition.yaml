@@ -2,11 +2,10 @@ name: nvidia-nemoguard-content-safety
 version: v0.1.0
 displayName: NeMo Guard Content Safety
 description: |
-  Validates request and/or response content using NVIDIA NeMo Guard
-  (llama-3.1-nemoguard-8b-content-safety). Request bodies are checked before
-  they reach the upstream LLM; response bodies are checked before they are
-  delivered to the client. Unsafe requests are rejected with a configurable
-  status code; unsafe responses are replaced with a sanitised error message.
+  Validates request and/or response content using NVIDIA NeMo Guard (llama-3.1-nemoguard-8b-content-safety).
+  Request bodies are checked before they reach the upstream LLM; response bodies are checked before they are delivered
+  to the client. Unsafe requests are rejected with a configurable status code; unsafe responses are replaced with a
+  sanitised error message.
 
   The model is a LoRA adapter on meta-llama/Llama-3.1-8B-Instruct served via
   vLLM with --enable-lora. It classifies content into 23 safety categories:
