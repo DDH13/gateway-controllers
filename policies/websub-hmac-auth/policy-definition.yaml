@@ -1,0 +1,43 @@
+name: websub-hmac-auth
+version: v1.0.0
+description: |
+  Validates HMAC signatures on incoming WebSub hub event notification requests.
+  The policy reads the X-Hub-Signature-256 (or X-Hub-Signature) header sent by
+  the WebSub hub, recomputes the HMAC over the raw request body using all active
+  shared secrets stored for the API (managed via the /websub-apis/{id}/secrets
+  endpoints), and accepts the request if any secret produces a matching signature.
+  Requests are rejected with 401 Unauthorized only when all secrets fail or no
+  secrets are configured.
+
+  Supports SHA-256 (default), SHA-512, and SHA-1 (legacy) algorithms, following
+  the W3C WebSub Recommendation (https://www.w3.org/TR/websub/).
+
+parameters:
+  type: object
+  additionalProperties: false
+  properties:
+    algorithm:
+      type: string
+      x-wso2-policy-advanced-param: false
+      description: |
+        HMAC algorithm to use when verifying the signature. Must match the
+        algorithm prefix in the signature header value (e.g. "sha256" for
+        "sha256=<digest>"). Defaults to "sha256".
+      default: sha256
+      enum:
+        - sha256
+        - sha512
+        - sha1
+
+    signatureHeader:
+      type: string
+      x-wso2-policy-advanced-param: false
+      description: |
+        Name of the HTTP request header that carries the hub's HMAC signature.
+        Defaults to "X-Hub-Signature-256" for sha256/sha512 algorithms, and
+        "X-Hub-Signature" for sha1.
+        Override this only if your hub uses a non-standard header name.
+      default: X-Hub-Signature-256
+      validation:
+        minLength: 1
+        maxLength: 128
