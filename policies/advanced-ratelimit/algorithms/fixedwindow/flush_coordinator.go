@@ -23,6 +23,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // flushCoordinator drives the flushes of ALL RedisLocalAsyncLimiters in the process from
@@ -196,6 +198,8 @@ func (c *flushCoordinator) tickShard(i int, now time.Time) {
 	sh := &c.shards[i]
 	nowNanos := now.UnixNano()
 
+	// Step 1 (lost-wakeup invariant): remove due limiters from the active set and clear
+	// `enqueued` BEFORE snapshotting, so a concurrently-arriving delta re-enqueues.
 	var due []*RedisLocalAsyncLimiter
 	sh.mu.Lock()
 	for l := range sh.active {
@@ -207,14 +211,114 @@ func (c *flushCoordinator) tickShard(i int, now time.Time) {
 	}
 	sh.mu.Unlock()
 
+	if len(due) > 0 {
+		c.flushDue(sh, due, now)
+	}
+}
+
+// limFlush is one limiter's contribution to a batched flush.
+type limFlush struct {
+	l     *RedisLocalAsyncLimiter
+	batch []pendingFlush
+	off   int             // offset into its client group's flat slice
+	cmds  []*redis.IntCmd // demuxed view of the group's results
+	errs  []error         // demuxed view of the group's per-entry exec errors
+	more  bool
+}
+
+// clientGroup batches all due limiters that share one Redis client into one pipeline.
+type clientGroup struct {
+	client  redis.UniversalClient
+	members []*limFlush
+	flat    []pendingFlush
+	exp     []expireEntry
+}
+
+// flushDue flushes all `due` limiters with one INCRBY pipeline (and one EXPIRE pipeline)
+// PER Redis client, instead of one pipeline per limiter — collapsing round-trips from
+// O(due) to O(clients). Each limiter's flushMu is held across snapshot->apply (so no other
+// flush of it interleaves) and released before any re-enqueue (preserving lock-order
+// invariant 1). Per-limiter fail-streak keeps fail-open/closed isolated across clients.
+func (c *flushCoordinator) flushDue(sh *coordShard, due []*RedisLocalAsyncLimiter, now time.Time) {
+	nowNanos := now.UnixNano()
+
+	// A: lock each limiter and snapshot its pending work. Empty snapshots are released
+	//    immediately (matches flushPending's early return: fail-streak untouched).
+	flushes := make([]*limFlush, 0, len(due))
 	for _, l := range due {
 		l.nextFlushAt.Store(now.Add(l.cfg.SyncInterval).UnixNano())
-		if l.flushPending() {
-			// Budget spill or error residue: due again at the next base tick.
-			l.nextFlushAt.Store(nowNanos)
-			if l.enqueued.CompareAndSwap(false, true) {
+		l.flushMu.Lock()
+		batch, more := l.snapshotPendingLocked(l.cfg.MaxPipelineCommands)
+		if len(batch) == 0 {
+			l.flushMu.Unlock()
+			if more { // defensive; budget>=1 makes this unreachable today
+				l.nextFlushAt.Store(nowNanos)
+				if l.enqueued.CompareAndSwap(false, true) {
+					sh.mu.Lock()
+					sh.active[l] = struct{}{}
+					sh.mu.Unlock()
+				}
+			}
+			continue
+		}
+		flushes = append(flushes, &limFlush{l: l, batch: batch, more: more})
+	}
+	if len(flushes) == 0 {
+		return
+	}
+
+	// B: group by Redis client (insertion-ordered; client count is tiny).
+	var groups []*clientGroup
+	for _, f := range flushes {
+		var g *clientGroup
+		for _, cand := range groups {
+			if cand.client == f.l.client {
+				g = cand
+				break
+			}
+		}
+		if g == nil {
+			g = &clientGroup{client: f.l.client}
+			groups = append(groups, g)
+		}
+		f.off = len(g.flat)
+		g.flat = append(g.flat, f.batch...)
+		g.members = append(g.members, f)
+	}
+
+	// C: one INCRBY pipeline per client (chunked); demux results back to members.
+	for _, g := range groups {
+		cmds, errs := execIncrBatch(g.client, g.flat, DefaultMaxPipelineCommands)
+		for _, f := range g.members {
+			f.cmds = cmds[f.off : f.off+len(f.batch)]
+			f.errs = errs[f.off : f.off+len(f.batch)]
+		}
+	}
+
+	// D: apply per limiter + per-limiter fail streak; collect EXPIREs per group.
+	for _, g := range groups {
+		for _, f := range g.members {
+			applyMore, creators, tickErr := f.l.applyResultsLocked(f.batch, f.cmds, f.errs)
+			f.more = f.more || applyMore
+			g.exp = append(g.exp, f.l.expireEntries(f.batch, creators)...)
+			f.l.noteFlushOutcomeLocked(tickErr)
+		}
+	}
+
+	// E: one EXPIRE pipeline per client for the freshly-created window keys.
+	for _, g := range groups {
+		execExpire(g.client, g.exp)
+	}
+
+	// F: release flushMu, THEN re-enqueue spilled limiters (release before sh.mu — keeps
+	//    coordShard.mu out of the flushMu/stripe lock order).
+	for _, f := range flushes {
+		f.l.flushMu.Unlock()
+		if f.more {
+			f.l.nextFlushAt.Store(nowNanos)
+			if f.l.enqueued.CompareAndSwap(false, true) {
 				sh.mu.Lock()
-				sh.active[l] = struct{}{}
+				sh.active[f.l] = struct{}{}
 				sh.mu.Unlock()
 			}
 		}

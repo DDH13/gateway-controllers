@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -474,5 +475,176 @@ func TestRedisLocalAsync_EvictionCarriesDelta(t *testing.T) {
 	}
 	if got := redisCount(t, client, b, ws); got != 1 {
 		t.Fatalf("b count = %d, want 1", got)
+	}
+}
+
+// pipeCounter is a go-redis Hook that counts pipeline executions (== Redis round-trips on
+// a single-node client) and the commands within them.
+type pipeCounter struct {
+	pipelines atomic.Int64
+	commands  atomic.Int64
+}
+
+func (h *pipeCounter) DialHook(next redis.DialHook) redis.DialHook       { return next }
+func (h *pipeCounter) ProcessHook(next redis.ProcessHook) redis.ProcessHook { return next }
+func (h *pipeCounter) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return func(ctx context.Context, cmds []redis.Cmder) error {
+		h.pipelines.Add(1)
+		h.commands.Add(int64(len(cmds)))
+		return next(ctx, cmds)
+	}
+}
+
+// TestRedisLocalAsync_BatchSingleRoundTrip is the v3 regression guard: two limiters
+// sharing one Redis client flush in ONE pipeline per shard tick (not one per limiter).
+func TestRedisLocalAsync_BatchSingleRoundTrip(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatalf("miniredis: %v", err)
+	}
+	t.Cleanup(mr.Close)
+	hook := &pipeCounter{}
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr(), DisableIdentity: true})
+	client.AddHook(hook)
+	t.Cleanup(func() { _ = client.Close() })
+
+	coord := newFlushCoordinator(1, false)
+	clk := limiter.NewFixedClock(time.Unix(15000, 0)) // far past -> no EXPIRE pipeline
+	mk := func() *RedisLocalAsyncLimiter {
+		b := NewRedisLimiter(client, NewPolicy(1000, time.Minute), "ratelimit:v1:")
+		l := newRedisLocalAsyncLimiterWith(b, LocalAsyncConfig{SyncInterval: 10 * time.Millisecond, FailOpen: true}, coord)
+		l.WithClock(clk)
+		t.Cleanup(func() { _ = l.Close() })
+		return l
+	}
+	a, b := mk(), mk()
+	ws := NewPolicy(1000, time.Minute).WindowStart(clk.Now())
+	for i := 0; i < 3; i++ {
+		mustAllow(t, a, "ka")
+	}
+	for i := 0; i < 4; i++ {
+		mustAllow(t, b, "kb")
+	}
+
+	hook.pipelines.Store(0)
+	hook.commands.Store(0)
+	coord.tickShard(0, time.Now().Add(time.Hour))
+
+	if p := hook.pipelines.Load(); p != 1 {
+		t.Fatalf("two limiters should flush in ONE pipeline, got %d", p)
+	}
+	if c := hook.commands.Load(); c != 2 {
+		t.Fatalf("one INCRBY per limiter expected (2), got %d", c)
+	}
+	if got := redisCount(t, client, "ka", ws); got != 3 {
+		t.Fatalf("a count = %d, want 3", got)
+	}
+	if got := redisCount(t, client, "kb", ws); got != 4 {
+		t.Fatalf("b count = %d, want 4", got)
+	}
+}
+
+// TestRedisLocalAsync_BatchFailIsolation: in a batch spanning two Redis clients, a limiter
+// on a dead client fails (fail-closed denies) while a limiter on a healthy client flushes
+// cleanly and keeps serving.
+func TestRedisLocalAsync_BatchFailIsolation(t *testing.T) {
+	mr1, _ := miniredis.Run()
+	t.Cleanup(mr1.Close)
+	mr2, _ := miniredis.Run()
+	fast := func(addr string) *redis.Client {
+		return redis.NewClient(&redis.Options{Addr: addr, DialTimeout: 200 * time.Millisecond, MaxRetries: -1})
+	}
+	c1, c2 := fast(mr1.Addr()), fast(mr2.Addr())
+	t.Cleanup(func() { _ = c1.Close() })
+	t.Cleanup(func() { _ = c2.Close() })
+
+	coord := newFlushCoordinator(1, false)
+	clk := limiter.NewFixedClock(time.Unix(16000, 0))
+	a := newRedisLocalAsyncLimiterWith(NewRedisLimiter(c1, NewPolicy(1000, time.Minute), "ratelimit:v1:"),
+		LocalAsyncConfig{SyncInterval: 10 * time.Millisecond, FailOpen: true}, coord)
+	a.WithClock(clk)
+	t.Cleanup(func() { _ = a.Close() })
+	b := newRedisLocalAsyncLimiterWith(NewRedisLimiter(c2, NewPolicy(100, time.Minute), "ratelimit:v1:"),
+		LocalAsyncConfig{SyncInterval: 10 * time.Millisecond, FailOpen: false}, coord)
+	b.WithClock(clk)
+	t.Cleanup(func() { _ = b.Close() })
+	wsA := NewPolicy(1000, time.Minute).WindowStart(clk.Now())
+
+	mustAllow(t, a, "ka")
+	mustAllow(t, b, "kb")
+	mr2.Close() // B's Redis goes down; A's stays up
+
+	// Two ticks so B's fail streak reaches the fail-closed threshold.
+	for i := 0; i < failClosedThreshold; i++ {
+		coord.tickShard(0, time.Now().Add(time.Duration(i+1)*time.Hour))
+	}
+
+	if got := redisCount(t, c1, "ka", wsA); got != 1 {
+		t.Fatalf("A (healthy client) should have flushed: count = %d", got)
+	}
+	if !mustAllow(t, a, "ka") {
+		t.Fatal("A on a healthy client should still allow")
+	}
+	if mustAllow(t, b, "kb") {
+		t.Fatal("B on a dead client (fail-closed) should deny")
+	}
+}
+
+// TestRedisLocalAsync_BatchPerLimiterSpill: a per-limiter MaxPipelineCommands bounds each
+// limiter's contribution to the shared batch; the rest spills to later ticks with no loss.
+func TestRedisLocalAsync_BatchPerLimiterSpill(t *testing.T) {
+	mr, _ := miniredis.Run()
+	t.Cleanup(mr.Close)
+	hook := &pipeCounter{}
+	client := redis.NewClient(&redis.Options{Addr: mr.Addr(), DisableIdentity: true})
+	client.AddHook(hook)
+	t.Cleanup(func() { _ = client.Close() })
+
+	coord := newFlushCoordinator(1, false)
+	clk := limiter.NewFixedClock(time.Unix(17000, 0))
+	a := newRedisLocalAsyncLimiterWith(NewRedisLimiter(client, NewPolicy(100000, time.Minute), "ratelimit:v1:"),
+		LocalAsyncConfig{SyncInterval: 10 * time.Millisecond, FailOpen: true, MaxPipelineCommands: 8}, coord)
+	a.WithClock(clk)
+	t.Cleanup(func() { _ = a.Close() })
+	b := newRedisLocalAsyncLimiterWith(NewRedisLimiter(client, NewPolicy(100000, time.Minute), "ratelimit:v1:bb:"),
+		LocalAsyncConfig{SyncInterval: 10 * time.Millisecond, FailOpen: true}, coord)
+	b.WithClock(clk)
+	t.Cleanup(func() { _ = b.Close() })
+	wsA := NewPolicy(100000, time.Minute).WindowStart(clk.Now())
+
+	const na = 20
+	for i := 0; i < na; i++ {
+		mustAllow(t, a, fmt.Sprintf("ka%d", i))
+	}
+	mustAllow(t, b, "kb")
+
+	hook.pipelines.Store(0)
+	hook.commands.Store(0)
+	coord.tickShard(0, time.Now().Add(time.Hour))
+
+	// One pipeline carrying A's budget (8) + B's 1 = 9 commands.
+	if p := hook.pipelines.Load(); p != 1 {
+		t.Fatalf("first tick pipelines = %d, want 1", p)
+	}
+	if c := hook.commands.Load(); c != 9 {
+		t.Fatalf("first tick commands = %d, want 9 (8+1)", c)
+	}
+	if !inActiveSet(coord, 0, a) {
+		t.Fatal("A should be re-enqueued (spill)")
+	}
+	if inActiveSet(coord, 0, b) {
+		t.Fatal("B should be done (no spill)")
+	}
+
+	// Drain the rest of A.
+	for i := 0; i < 6 && inActiveSet(coord, 0, a); i++ {
+		coord.tickShard(0, time.Now().Add(time.Duration(i+2)*time.Hour))
+	}
+	total := 0
+	for i := 0; i < na; i++ {
+		total += int(redisCount(t, client, fmt.Sprintf("ka%d", i), wsA))
+	}
+	if total != na {
+		t.Fatalf("spill lost or double-counted: total %d, want %d", total, na)
 	}
 }
