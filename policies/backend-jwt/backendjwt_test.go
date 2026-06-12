@@ -136,26 +136,9 @@ func TestMode(t *testing.T) {
 	}
 }
 
-func TestNoAuthContext_RequireAuth(t *testing.T) {
-	_, keyPEM := generateRSAKey(t)
-	p := &BackendJWTPolicy{keyCache: make(map[[32]byte]crypto.PrivateKey), pemCache: make(map[string][]byte), tokenCache: make(map[string]cachedToken)}
-	params := baseParams(keyPEM)
-	params["requireAuthentication"] = true
-
-	reqCtx := newRequestContext(nil)
-	result := p.OnRequestHeaders(context.Background(), reqCtx, params)
-
-	resp, ok := result.(policy.ImmediateResponse)
-	if !ok {
-		t.Fatalf("expected ImmediateResponse, got %T", result)
-	}
-	if resp.StatusCode != 401 {
-		t.Errorf("expected status 401, got %d", resp.StatusCode)
-	}
-}
 
 func TestNoAuthContext_NoRequireAuth(t *testing.T) {
-	_, keyPEM := generateRSAKey(t)
+	rsaKey, keyPEM := generateRSAKey(t)
 	p := &BackendJWTPolicy{keyCache: make(map[[32]byte]crypto.PrivateKey), pemCache: make(map[string][]byte), tokenCache: make(map[string]cachedToken)}
 	params := baseParams(keyPEM)
 
@@ -166,28 +149,34 @@ func TestNoAuthContext_NoRequireAuth(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected UpstreamRequestHeaderModifications, got %T", result)
 	}
-	if len(mods.HeadersToSet) != 0 {
-		t.Errorf("expected no headers set for unauthenticated pass-through, got %v", mods.HeadersToSet)
+	tokenStr, ok := mods.HeadersToSet[defaultHeader]
+	if !ok || tokenStr == "" {
+		t.Fatalf("expected backend JWT to be generated even without auth context")
+	}
+
+	// Parse without verification to inspect claims (we have the key, use it).
+	claims := decodeJWT(t, tokenStr, &rsaKey.PublicKey)
+
+	// System claims must be present.
+	if claims["iss"] != "https://gateway.example.com" {
+		t.Errorf("expected iss=https://gateway.example.com, got %v", claims["iss"])
+	}
+	if _, ok := claims["iat"]; !ok {
+		t.Error("iat claim must be present")
+	}
+	if _, ok := claims["exp"]; !ok {
+		t.Error("exp claim must be present")
+	}
+
+	// Auth-derived claims must be absent when there is no auth context.
+	if _, ok := claims["sub"]; ok {
+		t.Errorf("sub must be absent when no auth context, got %v", claims["sub"])
+	}
+	if _, ok := claims["auth_type"]; ok {
+		t.Errorf("auth_type must be absent when no auth context, got %v", claims["auth_type"])
 	}
 }
 
-func TestUnauthenticatedAuthContext_RequireAuth(t *testing.T) {
-	_, keyPEM := generateRSAKey(t)
-	p := &BackendJWTPolicy{keyCache: make(map[[32]byte]crypto.PrivateKey), pemCache: make(map[string][]byte), tokenCache: make(map[string]cachedToken)}
-	params := baseParams(keyPEM)
-	params["requireAuthentication"] = true
-
-	reqCtx := newRequestContext(&policy.AuthContext{Authenticated: false, AuthType: "jwt"})
-	result := p.OnRequestHeaders(context.Background(), reqCtx, params)
-
-	resp, ok := result.(policy.ImmediateResponse)
-	if !ok {
-		t.Fatalf("expected ImmediateResponse, got %T", result)
-	}
-	if resp.StatusCode != 401 {
-		t.Errorf("expected status 401, got %d", resp.StatusCode)
-	}
-}
 
 func TestGeneratesJWTWithSubject(t *testing.T) {
 	rsaKey, keyPEM := generateRSAKey(t)

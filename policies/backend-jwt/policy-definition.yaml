@@ -1,13 +1,14 @@
 name: backend-jwt
 version: v1.0.0
 description: |
-  Generates a signed JWT containing authenticated user information and injects it into the
-  upstream request header. Run this policy after an authentication policy (e.g. jwt-auth,
-  basic-auth, api-key-auth) to pass a gateway-signed assertion to backend services.
+  Generates a signed JWT and injects it into the upstream request header. Can be used
+  standalone or after an authentication policy (e.g. jwt-auth, basic-auth, api-key-auth).
 
-  The generated JWT includes the subject, authentication type, issuer (if set), audience,
-  and any custom or mapped claims. Backend services can verify it using the corresponding
-  public key without needing access to the original client credential.
+  When an auth policy has run, the generated JWT includes the subject, authentication type,
+  issuer, audience, and any custom or mapped claims. When no auth policy is present, only
+  system claims (iss, iat, exp) and non-auth custom claims are included. Backend services
+  can verify the JWT using the corresponding public key without needing access to the
+  original client credential.
 
 parameters:
   type: object
@@ -20,14 +21,6 @@ parameters:
       default: x-jwt-assertion
       minLength: 1
       pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
-
-    requireAuthentication:
-      type: boolean
-      x-wso2-policy-advanced-param: false
-      description: >-
-        If true, requests without a valid authentication context are rejected with 401.
-        If false, unauthenticated requests are forwarded without a backend JWT.
-      default: false
 
     claimMappings:
       type: object

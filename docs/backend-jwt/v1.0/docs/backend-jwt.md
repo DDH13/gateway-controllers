@@ -13,9 +13,7 @@ Backend services can verify the generated JWT using the gateway's corresponding 
 
 Generated tokens are cached in memory for half their configured `tokenExpiry` (minimum 30 seconds). The cache key is derived from the authenticated client identity, API operation path, and all resolved claim values. Requests from the same client hitting the same operation within the cache window receive the previously signed token, avoiding repeated cryptographic operations. Dynamic custom claims that differ between requests (e.g. `$ctx:request.header.*`) produce separate cache entries, preserving correctness.
 
-If no authentication context is present:
-- With `requireAuthentication: false` (default) — the request is forwarded without a backend JWT.
-- With `requireAuthentication: true` — the request is rejected with `401 Unauthorized`.
+If no authentication context is present (no auth policy in the chain), a backend JWT is still generated using the available system claims (`iss`, `iat`, `exp`). Auth-derived claims (`sub`, `auth_type`, `original_iss`, `aud`, `credential_id`) are omitted. Static `customClaims` and request-context variables (`$ctx:request.*`, `$ctx:api.*`) still resolve normally. To enforce that authentication must have occurred before this policy runs, add an auth policy earlier in the chain.
 
 ## Claims in the Generated Token
 
@@ -48,7 +46,6 @@ If no authentication context is present:
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `header` | string | `x-jwt-assertion` | Upstream request header to set the generated JWT on |
-| `requireAuthentication` | boolean | `false` | Reject unauthenticated requests with 401 when true |
 | `claimMappings` | object | `{}` | Maps upstream JWT claim names to backend JWT claim names (see below) |
 | `customClaims` | object | `{}` | Static or dynamic claim name→value pairs added to every generated token (see below) |
 

@@ -153,21 +153,7 @@ func (p *BackendJWTPolicy) Validate(params map[string]interface{}) error {
 
 // OnRequestHeaders generates a signed JWT from the auth context and sets it on the upstream request.
 func (p *BackendJWTPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.RequestHeaderContext, params map[string]interface{}) policy.RequestHeaderAction {
-	requireAuth := getBool(params, "requireAuthentication", false)
 	authCtx := reqCtx.SharedContext.AuthContext
-
-	if authCtx == nil || !authCtx.Authenticated {
-		if requireAuth {
-			slog.Debug("Backend JWT: no authenticated context, rejecting request")
-			return policy.ImmediateResponse{
-				StatusCode: 401,
-				Headers:    map[string]string{"content-type": "application/json"},
-				Body:       []byte(`{"error":"Unauthorized","message":"Authentication is required to generate a backend JWT"}`),
-			}
-		}
-		slog.Debug("Backend JWT: no authenticated context, passing through")
-		return policy.UpstreamRequestHeaderModifications{}
-	}
 
 	alg := getString(params, "algorithm", defaultAlgorithm)
 	entry, ok := algorithms[alg]
@@ -182,12 +168,17 @@ func (p *BackendJWTPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.
 	// Resolve extra claims once — used for both the cache key and JWT population.
 	extras := resolveExtraClaims(reqCtx, params)
 
-	cacheKey := buildTokenCacheKey(
-		authCtx.CredentialID, authCtx.Subject, reqCtx.APIContext, reqCtx.APIVersion,
-		authCtx.Audience, extras,
-	)
+	var credentialID, subject, tokenId string
+	var audience []string
+	if authCtx != nil {
+		credentialID = authCtx.CredentialID
+		subject = authCtx.Subject
+		tokenId = authCtx.TokenId
+		audience = authCtx.Audience
+	}
+	cacheKey := buildTokenCacheKey(credentialID, subject, reqCtx.APIContext, reqCtx.APIVersion, tokenId, audience, extras)
 	if signed, ok := p.getCachedToken(cacheKey); ok {
-		slog.Debug("Backend JWT: cache hit", "subject", authCtx.Subject)
+		slog.Debug("Backend JWT: cache hit", "subject", subject)
 		return policy.UpstreamRequestHeaderModifications{
 			HeadersToSet: map[string]string{headerName: signed},
 		}
@@ -217,21 +208,25 @@ func (p *BackendJWTPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.
 
 	now := time.Now()
 	claims := jwt.MapClaims{
-		"iat":       now.Unix(),
-		"exp":       now.Add(expiry).Unix(),
-		"sub":       authCtx.Subject,
-		"auth_type": authCtx.AuthType,
+		"iat": now.Unix(),
+		"exp": now.Add(expiry).Unix(),
 	}
 	if issuer != "" {
 		claims["iss"] = issuer
 	}
-	if authCtx.Issuer != "" {
+	if authCtx != nil && authCtx.Subject != "" {
+		claims["sub"] = authCtx.Subject
+	}
+	if authCtx != nil && authCtx.AuthType != "" {
+		claims["auth_type"] = authCtx.AuthType
+	}
+	if authCtx != nil && authCtx.Issuer != "" {
 		claims["original_iss"] = authCtx.Issuer
 	}
-	if len(authCtx.Audience) > 0 {
+	if authCtx != nil && len(authCtx.Audience) > 0 {
 		claims["aud"] = authCtx.Audience
 	}
-	if authCtx.CredentialID != "" {
+	if authCtx != nil && authCtx.CredentialID != "" {
 		claims["credential_id"] = authCtx.CredentialID
 	}
 	for k, v := range extras.stringClaims {
@@ -249,7 +244,7 @@ func (p *BackendJWTPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.
 	}
 
 	p.putCachedToken(cacheKey, signed, expiry)
-	slog.Debug("Backend JWT: generated token", "header", headerName, "subject", authCtx.Subject)
+	slog.Debug("Backend JWT: generated token", "header", headerName, "subject", subject)
 
 	return policy.UpstreamRequestHeaderModifications{
 		HeadersToSet: map[string]string{
@@ -288,6 +283,8 @@ var restrictedClaims = map[string]bool{
 	"aud": true,
 	"exp": true,
 	"iat": true,
+	"nbf": true,
+	"jti": true,
 }
 
 // resolveExtraClaims resolves claimMappings and customClaims from params.
@@ -354,7 +351,9 @@ func resolveExtraClaims(reqCtx *policy.RequestHeaderContext, params map[string]i
 
 // buildTokenCacheKey returns a hex SHA256 of the fields that determine what the generated JWT contains.
 // audience and extra claims are sorted so the key is deterministic regardless of slice/map ordering.
-func buildTokenCacheKey(credentialID, subject, apiContext, apiVersion string, audience []string, extras resolvedClaims) string {
+// jti is the upstream JWT ID (empty for non-JWT auth); when present it pins the cache entry to the
+// specific upstream token instance so that rotating the upstream JWT invalidates the cached backend JWT.
+func buildTokenCacheKey(credentialID, subject, apiContext, apiVersion, jti string, audience []string, extras resolvedClaims) string {
 	sortedAud := make([]string, len(audience))
 	copy(sortedAud, audience)
 	sort.Strings(sortedAud)
@@ -380,6 +379,8 @@ func buildTokenCacheKey(credentialID, subject, apiContext, apiVersion string, au
 	sb.WriteString(apiVersion)
 	sb.WriteByte('|')
 	sb.WriteString(strings.Join(sortedAud, ","))
+	sb.WriteByte('|')
+	sb.WriteString(jti)
 	for _, k := range allKeys {
 		sb.WriteByte('|')
 		sb.WriteString(k)
@@ -391,7 +392,20 @@ func buildTokenCacheKey(credentialID, subject, apiContext, apiVersion string, au
 		}
 	}
 	sum := sha256.Sum256([]byte(sb.String()))
-	return fmt.Sprintf("%x", sum)
+	key := fmt.Sprintf("%x", sum)
+
+	slog.Debug("Backend JWT: built token cache key",
+		"credentialID", credentialID,
+		"subject", subject,
+		"apiContext", apiContext,
+		"apiVersion", apiVersion,
+		"jti", jti,
+		"audience", sortedAud,
+		"extraClaimKeys", allKeys,
+		"cacheKey", key,
+	)
+
+	return key
 }
 
 // getCachedToken returns a previously signed token if it exists and has not yet expired.
@@ -534,14 +548,6 @@ func getString(params map[string]interface{}, key, defaultVal string) string {
 	return defaultVal
 }
 
-func getBool(params map[string]interface{}, key string, defaultVal bool) bool {
-	if v, ok := params[key]; ok {
-		if b, ok := v.(bool); ok {
-			return b
-		}
-	}
-	return defaultVal
-}
 
 func parseDuration(s string, fallback time.Duration) time.Duration {
 	if s == "" {
