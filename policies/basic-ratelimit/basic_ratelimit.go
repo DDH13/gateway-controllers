@@ -61,7 +61,7 @@ func (p *BasicRateLimitPolicy) Mode() policy.ProcessingMode {
 
 // transformToRatelimitParams converts the simple limits array to a full ratelimit
 // quota configuration with routename key extraction, and passes through system
-// parameters (algorithm, backend, redis, memory, local).
+// parameters (algorithm, backend, redis, memory).
 func transformToRatelimitParams(params map[string]interface{}, metadata policy.PolicyMetadata) map[string]interface{} {
 	limits, _ := params["limits"].([]interface{})
 
@@ -119,9 +119,6 @@ func transformToRatelimitParams(params map[string]interface{}, metadata policy.P
 	}
 	if memory, ok := params["memory"]; ok {
 		rlParams["memory"] = memory
-	}
-	if local, ok := params["local"]; ok {
-		rlParams["local"] = local
 	}
 
 	return rlParams
