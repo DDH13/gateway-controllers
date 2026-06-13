@@ -1465,6 +1465,8 @@ func (p *JwtAuthPolicy) handleAuthSuccessHeaders(shared *policy.SharedContext, c
 	userIdClaim string, headerName string, authHeaderValue string, forwardToken bool, forwardedTokenHeader string) policy.RequestHeaderAction {
 	sub, _ := claims["sub"].(string)
 	iss, _ := claims["iss"].(string)
+	jti, _ := claims["jti"].(string)
+	credential_id, _ := claims["client_id"].(string)
 
 	subject := sub
 	if userIdClaim != "" && userIdClaim != "sub" {
@@ -1484,6 +1486,8 @@ func (p *JwtAuthPolicy) handleAuthSuccessHeaders(shared *policy.SharedContext, c
 		Audience:      parseAudience(claims["aud"]),
 		Scopes:        buildScopesMap(claims),
 		Properties:    buildProperties(claims),
+		TokenId:       jti,
+		CredentialID:  credential_id,
 		Previous:      shared.AuthContext,
 	}
 
