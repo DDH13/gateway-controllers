@@ -168,17 +168,9 @@ func (p *BackendJWTPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.
 	// Resolve extra claims once — used for both the cache key and JWT population.
 	extras := resolveExtraClaims(reqCtx, params)
 
-	var credentialID, subject, tokenId string
-	var audience []string
-	if authCtx != nil {
-		credentialID = authCtx.CredentialID
-		subject = authCtx.Subject
-		tokenId = authCtx.TokenId
-		audience = authCtx.Audience
-	}
-	cacheKey := buildTokenCacheKey(credentialID, subject, reqCtx.APIContext, reqCtx.APIVersion, tokenId, audience, extras)
+	cacheKey := buildTokenCacheKey(authCtx, reqCtx.APIContext, reqCtx.APIVersion, extras)
 	if signed, ok := p.getCachedToken(cacheKey); ok {
-		slog.Debug("Backend JWT: cache hit", "subject", subject)
+		slog.Debug("Backend JWT: cache hit", "authType", authTypeLabel(authCtx))
 		return policy.UpstreamRequestHeaderModifications{
 			HeadersToSet: map[string]string{headerName: signed},
 		}
@@ -244,7 +236,7 @@ func (p *BackendJWTPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.
 	}
 
 	p.putCachedToken(cacheKey, signed, expiry)
-	slog.Debug("Backend JWT: generated token", "header", headerName, "subject", subject)
+	slog.Debug("Backend JWT: generated token", "header", headerName, "authType", authTypeLabel(authCtx))
 
 	return policy.UpstreamRequestHeaderModifications{
 		HeadersToSet: map[string]string{
@@ -349,38 +341,58 @@ func resolveExtraClaims(reqCtx *policy.RequestHeaderContext, params map[string]i
 	return result
 }
 
-// buildTokenCacheKey returns a hex SHA256 of the fields that determine what the generated JWT contains.
-// audience and extra claims are sorted so the key is deterministic regardless of slice/map ordering.
-// jti is the upstream JWT ID (empty for non-JWT auth); when present it pins the cache entry to the
-// specific upstream token instance so that rotating the upstream JWT invalidates the cached backend JWT.
-func buildTokenCacheKey(credentialID, subject, apiContext, apiVersion, jti string, audience []string, extras resolvedClaims) string {
-	sortedAud := make([]string, len(audience))
-	copy(sortedAud, audience)
-	sort.Strings(sortedAud)
+// buildTokenCacheKey returns a hex SHA256 cache key derived from the identity signals
+// most appropriate for the given auth mechanism, plus the API context and extra claims.
+// Dispatches per AuthType so each mechanism uses only its natural identity fields.
+func buildTokenCacheKey(authCtx *policy.AuthContext, apiContext, apiVersion string, extras resolvedClaims) string {
+	var sb strings.Builder
 
-	allKeys := make([]string, 0, len(extras.stringClaims)+len(extras.rawClaims))
-	for k := range extras.stringClaims {
-		allKeys = append(allKeys, k)
-	}
-	for k := range extras.rawClaims {
-		if _, exists := extras.stringClaims[k]; !exists {
-			allKeys = append(allKeys, k)
+	if authCtx != nil {
+		switch authCtx.AuthType {
+		case "jwt":
+			if authCtx.TokenId != "" {
+				// jti is a strong per-token identifier — sufficient on its own.
+				sb.WriteString(authCtx.TokenId)
+			} else {
+				// No jti: include issuer to prevent cross-issuer subject collisions.
+				sb.WriteString(authCtx.Issuer)
+				sb.WriteByte('|')
+				sb.WriteString(authCtx.Subject)
+				sb.WriteByte('|')
+				sb.WriteString(strings.Join(sortedSlice(authCtx.Audience), ","))
+			}
+		case "basic":
+			sb.WriteString(authCtx.Subject)
+		case "apikey":
+			// api-key-auth stores the per-application identifier in Properties["ApplicationID"].
+			// Fall back to CredentialID for other API key implementations.
+			if appID := authCtx.Properties["ApplicationID"]; appID != "" {
+				sb.WriteString(appID)
+			} else {
+				sb.WriteString(authCtx.CredentialID)
+			}
+		default:
+			// Unknown auth type: include all available identity fields.
+			sb.WriteString(authCtx.AuthType)
+			sb.WriteByte('|')
+			sb.WriteString(authCtx.CredentialID)
+			sb.WriteByte('|')
+			sb.WriteString(authCtx.Subject)
+			sb.WriteByte('|')
+			sb.WriteString(authCtx.TokenId)
+			sb.WriteByte('|')
+			sb.WriteString(strings.Join(sortedSlice(authCtx.Audience), ","))
 		}
 	}
-	sort.Strings(allKeys)
+	// authCtx == nil: identity portion is empty — all unauthenticated requests to
+	// the same API with the same extras share one backend JWT, which is correct.
 
-	var sb strings.Builder
-	sb.WriteString(credentialID)
-	sb.WriteByte('|')
-	sb.WriteString(subject)
 	sb.WriteByte('|')
 	sb.WriteString(apiContext)
 	sb.WriteByte('|')
 	sb.WriteString(apiVersion)
-	sb.WriteByte('|')
-	sb.WriteString(strings.Join(sortedAud, ","))
-	sb.WriteByte('|')
-	sb.WriteString(jti)
+
+	allKeys := sortedExtraKeys(extras)
 	for _, k := range allKeys {
 		sb.WriteByte('|')
 		sb.WriteString(k)
@@ -391,21 +403,47 @@ func buildTokenCacheKey(credentialID, subject, apiContext, apiVersion, jti strin
 			sb.WriteString(fmt.Sprintf("%v", extras.rawClaims[k]))
 		}
 	}
+
 	sum := sha256.Sum256([]byte(sb.String()))
 	key := fmt.Sprintf("%x", sum)
 
 	slog.Debug("Backend JWT: built token cache key",
-		"credentialID", credentialID,
-		"subject", subject,
+		"authType", authTypeLabel(authCtx),
 		"apiContext", apiContext,
 		"apiVersion", apiVersion,
-		"jti", jti,
-		"audience", sortedAud,
 		"extraClaimKeys", allKeys,
 		"cacheKey", key,
 	)
 
 	return key
+}
+
+func sortedSlice(s []string) []string {
+	out := make([]string, len(s))
+	copy(out, s)
+	sort.Strings(out)
+	return out
+}
+
+func sortedExtraKeys(extras resolvedClaims) []string {
+	keys := make([]string, 0, len(extras.stringClaims)+len(extras.rawClaims))
+	for k := range extras.stringClaims {
+		keys = append(keys, k)
+	}
+	for k := range extras.rawClaims {
+		if _, exists := extras.stringClaims[k]; !exists {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func authTypeLabel(authCtx *policy.AuthContext) string {
+	if authCtx == nil {
+		return "none"
+	}
+	return authCtx.AuthType
 }
 
 // getCachedToken returns a previously signed token if it exists and has not yet expired.

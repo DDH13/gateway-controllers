@@ -812,6 +812,135 @@ func TestTokenCache_EvictExpired(t *testing.T) {
 	}
 }
 
+// ─── Cache Key Strategy Tests ────────────────────────────────────────────────
+
+func TestTokenCacheKey_JWT_JTIRotation(t *testing.T) {
+	// Different jti on same subject/issuer must produce separate cache entries.
+	_, keyPEM := generateRSAKey(t)
+	p := &BackendJWTPolicy{keyCache: make(map[[32]byte]crypto.PrivateKey), pemCache: make(map[string][]byte), tokenCache: make(map[string]cachedToken)}
+	params := baseParams(keyPEM)
+
+	p.OnRequestHeaders(context.Background(), newRequestContext(&policy.AuthContext{
+		Authenticated: true, AuthType: "jwt", Subject: "alice", Issuer: "https://idp.example.com",
+		TokenId: "token-aaa",
+	}), params)
+	p.OnRequestHeaders(context.Background(), newRequestContext(&policy.AuthContext{
+		Authenticated: true, AuthType: "jwt", Subject: "alice", Issuer: "https://idp.example.com",
+		TokenId: "token-bbb",
+	}), params)
+
+	p.tokenMu.RLock()
+	count := len(p.tokenCache)
+	p.tokenMu.RUnlock()
+	if count != 2 {
+		t.Errorf("different jti must produce separate cache entries, got %d", count)
+	}
+}
+
+func TestTokenCacheKey_JWT_SameJTI_HitsCache(t *testing.T) {
+	// Same jti must hit the cache regardless of other fields.
+	_, keyPEM := generateRSAKey(t)
+	p := &BackendJWTPolicy{keyCache: make(map[[32]byte]crypto.PrivateKey), pemCache: make(map[string][]byte), tokenCache: make(map[string]cachedToken)}
+	params := baseParams(keyPEM)
+	authCtx := &policy.AuthContext{
+		Authenticated: true, AuthType: "jwt", Subject: "alice", TokenId: "token-xyz",
+	}
+
+	p.OnRequestHeaders(context.Background(), newRequestContext(authCtx), params)
+	p.OnRequestHeaders(context.Background(), newRequestContext(authCtx), params)
+
+	p.tokenMu.RLock()
+	count := len(p.tokenCache)
+	p.tokenMu.RUnlock()
+	if count != 1 {
+		t.Errorf("same jti must share one cache entry, got %d", count)
+	}
+}
+
+func TestTokenCacheKey_JWT_CrossIssuerNoJTI(t *testing.T) {
+	// Without jti, tokens from different issuers with the same subject must not collide.
+	_, keyPEM := generateRSAKey(t)
+	p := &BackendJWTPolicy{keyCache: make(map[[32]byte]crypto.PrivateKey), pemCache: make(map[string][]byte), tokenCache: make(map[string]cachedToken)}
+	params := baseParams(keyPEM)
+
+	p.OnRequestHeaders(context.Background(), newRequestContext(&policy.AuthContext{
+		Authenticated: true, AuthType: "jwt", Subject: "alice", Issuer: "https://idp-a.example.com",
+	}), params)
+	p.OnRequestHeaders(context.Background(), newRequestContext(&policy.AuthContext{
+		Authenticated: true, AuthType: "jwt", Subject: "alice", Issuer: "https://idp-b.example.com",
+	}), params)
+
+	p.tokenMu.RLock()
+	count := len(p.tokenCache)
+	p.tokenMu.RUnlock()
+	if count != 2 {
+		t.Errorf("same subject from different issuers (no jti) must produce separate cache entries, got %d", count)
+	}
+}
+
+func TestTokenCacheKey_APIKey_DifferentApplicationID(t *testing.T) {
+	// Different API key ApplicationIDs must produce separate cache entries.
+	_, keyPEM := generateRSAKey(t)
+	p := &BackendJWTPolicy{keyCache: make(map[[32]byte]crypto.PrivateKey), pemCache: make(map[string][]byte), tokenCache: make(map[string]cachedToken)}
+	params := baseParams(keyPEM)
+
+	p.OnRequestHeaders(context.Background(), newRequestContext(&policy.AuthContext{
+		Authenticated: true, AuthType: "apikey",
+		Properties: map[string]string{"ApplicationID": "app-001", "ApplicationName": "App One"},
+	}), params)
+	p.OnRequestHeaders(context.Background(), newRequestContext(&policy.AuthContext{
+		Authenticated: true, AuthType: "apikey",
+		Properties: map[string]string{"ApplicationID": "app-002", "ApplicationName": "App Two"},
+	}), params)
+
+	p.tokenMu.RLock()
+	count := len(p.tokenCache)
+	p.tokenMu.RUnlock()
+	if count != 2 {
+		t.Errorf("different ApplicationIDs must produce separate cache entries, got %d", count)
+	}
+}
+
+func TestTokenCacheKey_APIKey_SameApplicationID_HitsCache(t *testing.T) {
+	// Same ApplicationID must share one cache entry regardless of other metadata.
+	_, keyPEM := generateRSAKey(t)
+	p := &BackendJWTPolicy{keyCache: make(map[[32]byte]crypto.PrivateKey), pemCache: make(map[string][]byte), tokenCache: make(map[string]cachedToken)}
+	params := baseParams(keyPEM)
+
+	p.OnRequestHeaders(context.Background(), newRequestContext(&policy.AuthContext{
+		Authenticated: true, AuthType: "apikey",
+		Properties: map[string]string{"ApplicationID": "app-001", "ApplicationName": "First Call"},
+	}), params)
+	p.OnRequestHeaders(context.Background(), newRequestContext(&policy.AuthContext{
+		Authenticated: true, AuthType: "apikey",
+		Properties: map[string]string{"ApplicationID": "app-001", "ApplicationName": "Second Call"},
+	}), params)
+
+	p.tokenMu.RLock()
+	count := len(p.tokenCache)
+	p.tokenMu.RUnlock()
+	if count != 1 {
+		t.Errorf("same ApplicationID must share one cache entry, got %d", count)
+	}
+}
+
+func TestTokenCacheKey_NoAuth_SharedEntry(t *testing.T) {
+	// Multiple unauthenticated requests to the same API must share one cache entry.
+	_, keyPEM := generateRSAKey(t)
+	p := &BackendJWTPolicy{keyCache: make(map[[32]byte]crypto.PrivateKey), pemCache: make(map[string][]byte), tokenCache: make(map[string]cachedToken)}
+	params := baseParams(keyPEM)
+
+	p.OnRequestHeaders(context.Background(), newRequestContext(nil), params)
+	p.OnRequestHeaders(context.Background(), newRequestContext(nil), params)
+
+	p.tokenMu.RLock()
+	count := len(p.tokenCache)
+	p.tokenMu.RUnlock()
+	if count != 1 {
+		t.Errorf("multiple unauthenticated requests must share one cache entry, got %d", count)
+	}
+}
+
 // ─── Context Claims Tests ─────────────────────────────────────────────────────
 
 func TestContextClaims_StaticPassthrough(t *testing.T) {
