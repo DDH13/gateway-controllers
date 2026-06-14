@@ -178,7 +178,7 @@ Configures per-quota dynamic cost extraction from request or response data. Valu
 | `key` | string | Conditional | Header name or metadata key. Required for `request_header`, `request_metadata`, `response_header`, `response_metadata` types (1-256 chars). |
 | `jsonPath` | string | Conditional | JSONPath expression. Required for `request_body` and `response_body` types (1-512 chars). |
 | `expression` | string | Conditional | CEL expression returning a numeric result. Required for `request_cel` and `response_cel` types (1-1024 chars). |
-| `multiplier` | number | No | `1.0` | Multiplier applied to the extracted value (minimum 0). |
+| `multiplier` | number | No | Multiplier applied to the extracted value (default: `1.0`, minimum 0). |
 
 **Source Types:**
 
@@ -634,14 +634,14 @@ spec:
 
 ## How it Works
 
-#### GCRA (Generic Cell Rate Algorithm)
+### GCRA (Generic Cell Rate Algorithm)
 
 - Token bucket semantics with smooth rate limiting
 - **Best for**: Smooth traffic shaping, burst handling, consistent rate enforcement
 - **Advantages**: Prevents traffic bursts at window boundaries, supports burst capacity
 - **Use when**: You need consistent rate enforcement and burst tolerance
 
-#### Fixed Window
+### Fixed Window
 
 - Divides time into fixed intervals and counts requests per window
 - **Best for**: Simple counting, lower computational overhead
@@ -654,7 +654,7 @@ spec:
 
 When rate limiting is applied, the following headers may be included in responses:
 
-##### X-RateLimit Headers (Industry Standard)
+### X-RateLimit Headers (Industry Standard)
 
 | Header | Description |
 |--------|-------------|
@@ -662,7 +662,7 @@ When rate limiting is applied, the following headers may be included in response
 | `X-RateLimit-Remaining` | Remaining requests in the current window |
 | `X-RateLimit-Reset` | Unix timestamp when the rate limit resets |
 
-##### IETF RateLimit Headers (Draft Standard)
+### IETF RateLimit Headers (Draft Standard)
 
 | Header | Description |
 |--------|-------------|
@@ -671,7 +671,7 @@ When rate limiting is applied, the following headers may be included in response
 | `RateLimit-Reset` | Seconds until the rate limit resets |
 | `RateLimit-Policy` | Rate limit policy description |
 
-##### Retry-After Header (RFC 7231)
+### Retry-After Header (RFC 7231)
 
 | Header | Description |
 |--------|-------------|
