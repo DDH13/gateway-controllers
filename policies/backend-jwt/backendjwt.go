@@ -154,7 +154,7 @@ func (p *BackendJWTPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.
 
 	var cacheKey string
 	if tokenCaching {
-		cacheKey = buildTokenCacheKey(authCtx, reqCtx.APIName, reqCtx.Path, reqCtx.Method, extras)
+		cacheKey = buildTokenCacheKey(authCtx, reqCtx.Path, reqCtx.Method, extras)
 		if signed, ok := p.getCachedToken(cacheKey); ok {
 			slog.Debug("Backend JWT: cache hit", "authType", authTypeLabel(authCtx))
 			return policy.UpstreamRequestHeaderModifications{
@@ -351,15 +351,18 @@ var keyBufPool = sync.Pool{New: func() interface{} { return new(bytes.Buffer) }}
 
 // buildTokenCacheKey returns a cache key for the token cache.
 //
-//   - TokenId, no dynamic extras:  raw concatenation — TokenId + api name + path + method.
+//   - TokenId, no dynamic extras:  raw concatenation — TokenId + path + method.
 //   - TokenId, with dynamic extras: SHA256 of the above + resolved $ctx: claim values.
-//   - authCtx nil:                  SHA256 of api name + path + method + dynamic extras.
-//   - otherwise:                    SHA256 of all identity fields + api name + path + method + dynamic extras.
+//   - authCtx nil:                  SHA256 of path + method + dynamic extras.
+//   - otherwise:                    SHA256 of all identity fields + path + method + dynamic extras.
+//
+// apiName is omitted: the gateway enforces globally unique path prefixes per API, so
+// path+method already uniquely identifies the operation and its configuration.
 //
 // Only $ctx:-resolved customClaims are included in the key because they vary per-request.
-// Static customClaims and claimMappings are constant per-API config (already disambiguated by
-// apiName) or per-identity (already captured in the identity hash), so they add no information.
-func buildTokenCacheKey(authCtx *policy.AuthContext, apiName, path, method string, extras resolvedClaims) string {
+// Static customClaims and claimMappings are constant per-operation config or per-identity
+// (already captured in the identity hash), so they add no information.
+func buildTokenCacheKey(authCtx *policy.AuthContext, path, method string, extras resolvedClaims) string {
 	if i := strings.IndexByte(path, '?'); i != -1 {
 		path = path[:i]
 	}
@@ -372,16 +375,14 @@ func buildTokenCacheKey(authCtx *policy.AuthContext, apiName, path, method strin
 	if authCtx != nil && authCtx.TokenId != "" {
 		if len(extraKeys) == 0 {
 			// Fast path: no extras, no hash needed.
-			key := authCtx.TokenId + "\x00" + apiName + "\x00" + path + "\x00" + method
-			slog.Debug("Backend JWT: cache key (TokenId)", "apiName", apiName, "path", path, "method", method, "cacheKey", key)
+			key := authCtx.TokenId + "\x00" + path + "\x00" + method
+			slog.Debug("Backend JWT: cache key (TokenId)", "path", path, "method", method, "cacheKey", key)
 			return key
 		}
 		// Extras present: SHA256 to normalize key length.
 		buf := keyBufPool.Get().(*bytes.Buffer)
 		buf.Reset()
 		buf.WriteString(authCtx.TokenId)
-		buf.WriteByte('|')
-		buf.WriteString(apiName)
 		buf.WriteByte('|')
 		buf.WriteString(path)
 		buf.WriteByte('|')
@@ -390,7 +391,7 @@ func buildTokenCacheKey(authCtx *policy.AuthContext, apiName, path, method strin
 		sum := sha256.Sum256(buf.Bytes())
 		keyBufPool.Put(buf)
 		key := fmt.Sprintf("%x", sum)
-		slog.Debug("Backend JWT: cache key (TokenId+claims)", "apiName", apiName, "path", path, "method", method, "extraClaimKeys", extraKeys, "cacheKey", key)
+		slog.Debug("Backend JWT: cache key (TokenId+claims)", "path", path, "method", method, "extraClaimKeys", extraKeys, "cacheKey", key)
 		return key
 	}
 
@@ -399,15 +400,13 @@ func buildTokenCacheKey(authCtx *policy.AuthContext, apiName, path, method strin
 	defer keyBufPool.Put(buf)
 
 	if authCtx == nil {
-		buf.WriteString(apiName)
-		buf.WriteByte('|')
 		buf.WriteString(path)
 		buf.WriteByte('|')
 		buf.WriteString(method)
 		appendExtras(buf, extraKeys, extras)
 		sum := sha256.Sum256(buf.Bytes())
 		key := fmt.Sprintf("%x", sum)
-		slog.Debug("Backend JWT: cache key (no-auth)", "apiName", apiName, "path", path, "method", method, "extraClaimKeys", extraKeys, "cacheKey", key)
+		slog.Debug("Backend JWT: cache key (no-auth)", "path", path, "method", method, "extraClaimKeys", extraKeys, "cacheKey", key)
 		return key
 	}
 
@@ -443,8 +442,6 @@ func buildTokenCacheKey(authCtx *policy.AuthContext, apiName, path, method strin
 		buf.WriteString(strings.Join(scopeKeys, " "))
 	}
 	buf.WriteByte('|')
-	buf.WriteString(apiName)
-	buf.WriteByte('|')
 	buf.WriteString(path)
 	buf.WriteByte('|')
 	buf.WriteString(method)
@@ -454,7 +451,6 @@ func buildTokenCacheKey(authCtx *policy.AuthContext, apiName, path, method strin
 	key := fmt.Sprintf("%x", sum)
 	slog.Debug("Backend JWT: cache key (identity hash)",
 		"authType", authTypeLabel(authCtx),
-		"apiName", apiName,
 		"path", path,
 		"method", method,
 		"extraClaimKeys", extraKeys,
