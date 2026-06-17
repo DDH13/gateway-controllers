@@ -53,7 +53,7 @@ If no authentication context is present (no auth policy in the chain), a backend
 | `claimMappings` | object | `{}` | Maps upstream JWT claim names to backend JWT claim names (see below) |
 | `customClaims` | object | `{}` | Static or dynamic claim name→value pairs added to every generated token (see below) |
 | `tokenExpiry` | string | _(system default)_ | Override the system `tokenExpiry` for this API (e.g. `"5m"`, `"1h"`). When set, takes precedence over the system-level value. |
-| `dialect` | string | `""` | Namespace prefix applied to auto-forwarded original-JWT claims. When set, each claim forwarded from the incoming JWT's properties is emitted as `<dialect><claimName>` (e.g. `"http://wso2.org/claims/"` turns `email` into `http://wso2.org/claims/email`). Does not affect standard claims (`sub`, `scope`, etc.) or explicitly configured `claimMappings`/`customClaims`. |
+| `dialect` | string | `""` | Namespace prefix applied to all user-configured and auto-forwarded claims. When set, auto-forwarded original-JWT claims, `claimMappings` destinations, and `customClaims` keys are all emitted as `<dialect><claimName>` (e.g. `"http://wso2.org/claims/"` turns `email` into `http://wso2.org/claims/email`). Does not affect standard claims set by the policy itself (`sub`, `iss`, `aud`, `scope`, etc.). |
 | `excludedClaims` | string[] | `[]` | List of original-JWT claim names to exclude from auto-forwarding. Matched by original name before any `dialect` prefix is applied. Does not affect standard claims or explicitly configured `claimMappings`/`customClaims`. |
 
 ## Claim Mappings

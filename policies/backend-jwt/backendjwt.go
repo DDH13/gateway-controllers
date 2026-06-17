@@ -224,10 +224,10 @@ func (p *BackendJWTPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.
 		}
 	}
 	for k, v := range extras.stringClaims {
-		claims[k] = v
+		claims[dialect+k] = v
 	}
 	for k, v := range extras.rawClaims {
-		claims[k] = v
+		claims[dialect+k] = v
 	}
 
 	token := jwt.NewWithClaims(signingMethod, claims)

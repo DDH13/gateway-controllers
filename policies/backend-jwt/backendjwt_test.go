@@ -1519,8 +1519,9 @@ func TestDialect_PrefixesForwardedClaims(t *testing.T) {
 	}
 }
 
-func TestDialect_DoesNotAffectStandardOrConfiguredClaims(t *testing.T) {
-	// dialect must not affect sub, scope, or explicitly configured claimMappings/customClaims.
+func TestDialect_PrefixesConfiguredClaims(t *testing.T) {
+	// dialect must prefix customClaims and claimMappings destinations as well as auto-forwarded claims.
+	// Standard claims (sub, scope, iss, etc.) set by the policy itself must never be prefixed.
 	rsaKey, keyPEM := generateRSAKey(t)
 	p := newTestPolicy()
 	params := baseParams(keyPEM)
@@ -1540,20 +1541,26 @@ func TestDialect_DoesNotAffectStandardOrConfiguredClaims(t *testing.T) {
 	mods := result.(policy.UpstreamRequestHeaderModifications)
 	claims := decodeJWT(t, mods.HeadersToSet[defaultHeader], &rsaKey.PublicKey)
 
-	// Standard claims must use their standard names (no prefix).
+	// Standard claims must use their standard names — never prefixed.
 	if claims["sub"] != "alice" {
 		t.Errorf("sub must not be prefixed, got %v", claims["sub"])
 	}
 	if claims["scope"] != "read" {
 		t.Errorf("scope must not be prefixed, got %v", claims["scope"])
 	}
-	// customClaims must use their configured name (no prefix).
-	if claims["org"] != "acme" {
-		t.Errorf("customClaim 'org' must not be prefixed by dialect, got %v", claims["org"])
+	// customClaims destination must be prefixed.
+	if claims["http://wso2.org/claims/org"] != "acme" {
+		t.Errorf("customClaim 'org' must be prefixed, got %v", claims["http://wso2.org/claims/org"])
 	}
-	// claimMappings must use their configured destination name (no prefix).
-	if claims["clientEmail"] != "alice@example.com" {
-		t.Errorf("claimMapping destination 'clientEmail' must not be prefixed by dialect, got %v", claims["clientEmail"])
+	if _, present := claims["org"]; present {
+		t.Errorf("bare customClaim key 'org' must not appear when dialect is set")
+	}
+	// claimMappings destination must be prefixed.
+	if claims["http://wso2.org/claims/clientEmail"] != "alice@example.com" {
+		t.Errorf("claimMapping destination 'clientEmail' must be prefixed, got %v", claims["http://wso2.org/claims/clientEmail"])
+	}
+	if _, present := claims["clientEmail"]; present {
+		t.Errorf("bare claimMapping destination 'clientEmail' must not appear when dialect is set")
 	}
 }
 

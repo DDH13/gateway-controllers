@@ -63,13 +63,12 @@ parameters:
       type: string
       x-wso2-policy-advanced-param: true
       description: >-
-        Namespace prefix applied to auto-forwarded original-JWT claims only. When set,
-        each claim forwarded from the incoming JWT's Properties is emitted as
-        "<dialect><claimName>" instead of "<claimName>" (e.g. "http://wso2.org/claims/"
-        turns "email" into "http://wso2.org/claims/email"). Does not affect standard
-        registered claims (sub, scope, etc.) nor explicitly configured claimMappings or
-        customClaims — those are emitted under the exact names the user configured.
-        Default "" leaves claim names unchanged.
+        Namespace prefix applied to all user-configured and auto-forwarded claims. When
+        set, auto-forwarded original-JWT claims, claimMappings destinations, and
+        customClaims keys are all emitted as "<dialect><claimName>" (e.g.
+        "http://wso2.org/claims/" turns "email" into "http://wso2.org/claims/email").
+        Does not affect standard claims set by the policy itself (sub, iss, aud, scope,
+        etc.). Default "" leaves claim names unchanged.
       default: ""
 
     excludedClaims:
