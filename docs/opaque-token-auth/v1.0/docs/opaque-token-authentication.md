@@ -1,0 +1,246 @@
+---
+title: "Overview"
+---
+# Opaque Token Authentication
+
+## Overview
+
+The Opaque Token Authentication policy validates opaque OAuth 2.0 access tokens — reference tokens that carry no inline claims — by calling an authorization server's [RFC 7662](https://www.rfc-editor.org/rfc/rfc7662.html) token introspection endpoint. The gateway forwards the bearer token to the introspection endpoint, authenticates itself, and admits the request only when the response reports `active: true`. It is typically applied to operations that require bearer token authentication before requests are forwarded upstream.
+
+Use this policy when your authorization server issues opaque (reference) tokens. For self-contained JWT access tokens validated locally against JWKS, use the JWT Authentication policy instead.
+
+## Features
+
+- Validates opaque access tokens via RFC 7662 token introspection
+- Supports multiple introspection providers with ordered fallback
+- Gateway client authentication via `client_secret_basic`, `client_secret_post`, or a static bearer token
+- Custom CA / skip-TLS-verify options for the introspection endpoint
+- Short-lived caching of active responses, never beyond the token's `exp`
+- Configurable audience, scope, and required-claim validation
+- Claim-to-header mappings for downstream services
+- Authorization header scheme enforcement and clock skew tolerance
+- Customizable error responses
+- Optional `userIdClaim` mapping for analytics
+- Optional forwarding of the token to the upstream under a configurable header name
+
+## How it Works
+
+1. The policy extracts the token from the configured authorization header.
+2. It selects introspection providers (by the user-level `issuers` list, or all providers in order).
+3. For each selected provider, it POSTs `token` (and `token_type_hint`) to the introspection endpoint as `application/x-www-form-urlencoded`, authenticating itself with the configured client credentials or bearer token, until a provider reports the token `active`.
+4. Active responses are cached, keyed by a SHA-256 of the token, expiring at `min(introspectionCacheTtl, token exp)`. Inactive responses are never cached.
+5. The policy then enforces audiences, scopes, and required claims, populates the authentication context, and applies any claim-to-header mappings before forwarding upstream.
+
+## Configuration
+
+Opaque Token Authentication requires two levels of configuration.
+
+### System Parameters (config.toml)
+
+| Parameter | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `introspectionproviders` | ```IntrospectionProvider``` array | Yes | - | List of introspection endpoint definitions. |
+| `introspectioncachettl` | string | No | `"60s"` | Cache TTL for active introspection responses (never exceeds token `exp`). |
+| `introspectiontimeout` | string | No | `"5s"` | Timeout for each introspection request. |
+| `introspectionretrycount` | integer | No | `2` | Introspection retry count on transient failures. |
+| `introspectionretryinterval` | string | No | `"1s"` | Interval between introspection retries. |
+| `leeway` | string | No | `"30s"` | Clock skew allowance for local exp/nbf re-checks. |
+| `authheaderscheme` | string | No | `"Bearer"` | Expected authorization scheme prefix. |
+| `headername` | string | No | `"Authorization"` | Header name to extract the token from. |
+| `onfailurestatuscode` | integer | No | `401` | HTTP status code on authentication failure. |
+| `errormessageformat` | string | No | `"json"` | Error format: `"json"`, `"plain"`, or `"minimal"`. |
+| `errormessage` | string | No | `"Authentication failed"` | Error message body for failures. |
+
+#### IntrospectionProvider Configuration
+
+Each entry in `introspectionproviders` must include a unique `name` and an `introspection` configuration whose `uri` is required.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `name` | string | Yes | Unique provider name (referenced by `user.issuers`). |
+| `issuer` | string | No | Optional issuer value for this provider (also matchable via `user.issuers`). |
+| `introspection.uri` | string | Yes | RFC 7662 introspection endpoint URL. |
+| `introspection.clientId` | string | No | OAuth2 client id for gateway client authentication. |
+| `introspection.clientSecret` | string | No | OAuth2 client secret paired with `clientId`. |
+| `introspection.authStyle` | string | No | `"basic"` (client_secret_basic, default) or `"post"` (client_secret_post). |
+| `introspection.bearerToken` | string | No | Static bearer token used instead of client credentials. |
+| `introspection.tokenTypeHint` | string | No | `token_type_hint` sent with the request (default `access_token`). |
+| `introspection.certificatePath` | string | No | CA cert path for a self-signed introspection endpoint. |
+| `introspection.skipTlsVerify` | boolean | No | Skip TLS verification (use with caution). |
+
+#### Sample System Configuration
+
+```toml
+[policy_configurations.opaquetokenauth_v1]
+introspectioncachettl = "60s"
+introspectiontimeout = "5s"
+introspectionretrycount = 2
+introspectionretryinterval = "1s"
+leeway = "30s"
+authheaderscheme = "Bearer"
+headername = "Authorization"
+onfailurestatuscode = 401
+errormessageformat = "json"
+errormessage = "Authentication failed"
+
+[[policy_configurations.opaquetokenauth_v1.introspectionproviders]]
+name = "PrimaryIDP"
+issuer = "https://idp.example.com/oauth2/token"
+
+[policy_configurations.opaquetokenauth_v1.introspectionproviders.introspection]
+uri = "https://idp.example.com/oauth2/introspect"
+clientId = "gateway-client"
+clientSecret = "gateway-secret"
+authStyle = "basic"
+tokenTypeHint = "access_token"
+skipTlsVerify = false
+```
+
+### User Parameters (API Definition)
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `issuers` | array | No | List of provider names (or issuer values) to use. If omitted, providers are tried in order until one reports the token active. |
+| `audiences` | array | No | Acceptable audience values. The response must contain at least one. |
+| `requiredScopes` | array | No | Required scopes. Uses the space-delimited `scope` member or array `scp` member. |
+| `requiredClaims` | object | No | Map of claim name to expected value. |
+| `claimMappings` | object | No | Map of introspection response member to downstream header name. |
+| `authHeaderPrefix` | string | No | Overrides the configured authorization header scheme for this route. |
+| `headerName` | string | No | Header name to extract the token from. Overrides `system.headerName`. Must be a valid HTTP header field name. |
+| `userIdClaim` | string | No | Member to extract the user ID for analytics. Defaults to `sub`. |
+| `forwardToken` | boolean | No | If `true` (default), the token is forwarded to the upstream after successful validation. Set to `false` to strip the token header before proxying. |
+| `forwardedTokenHeader` | string | No | Header name used to forward the token to the upstream when `forwardToken` is `true`. Defaults to `x-forwarded-authorization`. If this differs from `headerName`, the original header is removed and the token is forwarded under this name instead. Has no effect when `forwardToken` is `false`. |
+
+**Note:**
+
+Inside the `gateway/build.yaml`, ensure the policy module is added under `policies:`:
+
+```yaml
+- name: opaque-token-auth
+  gomodule: github.com/wso2/gateway-controllers/policies/opaque-token-auth@v1
+```
+
+## Reference Scenarios
+
+### Example 1: Basic Opaque Token Authentication
+
+```yaml
+apiVersion: gateway.api-platform.wso2.com/v1alpha1
+kind: RestApi
+metadata:
+  name: opaque-token-basic-api
+spec:
+  displayName: Opaque Token Basic API
+  version: v1.0
+  context: /opaque-basic/$version
+  upstream:
+    main:
+      url: http://sample-backend:9080/api/v1
+  operations:
+    - method: GET
+      path: /health
+    - method: GET
+      path: /protected
+      policies:
+        - name: opaque-token-auth
+          version: v1
+          params:
+            issuers:
+              - PrimaryIDP
+```
+
+### Example 2: Audience and Scope Validation
+
+```yaml
+apiVersion: gateway.api-platform.wso2.com/v1alpha1
+kind: RestApi
+metadata:
+  name: opaque-token-audience-api
+spec:
+  displayName: Opaque Token Audience API
+  version: v1.0
+  context: /opaque-audience/$version
+  upstream:
+    main:
+      url: http://sample-backend:9080/api/v1
+  operations:
+    - method: GET
+      path: /protected
+      policies:
+        - name: opaque-token-auth
+          version: v1
+          params:
+            issuers:
+              - PrimaryIDP
+            audiences:
+              - "test-audience"
+            requiredScopes:
+              - read:data
+```
+
+### Example 3: Claim Mapping to Downstream Headers
+
+```yaml
+apiVersion: gateway.api-platform.wso2.com/v1alpha1
+kind: RestApi
+metadata:
+  name: opaque-token-claims-api
+spec:
+  displayName: Opaque Token Claims API
+  version: v1.0
+  context: /opaque-claims/$version
+  upstream:
+    main:
+      url: http://sample-backend:9080/api/v1
+  operations:
+    - method: GET
+      path: /profile
+      policies:
+        - name: opaque-token-auth
+          version: v1
+          params:
+            issuers:
+              - PrimaryIDP
+            claimMappings:
+              sub: X-User-ID
+              username: X-User-Name
+              client_id: X-Client-ID
+```
+
+### Example 4: Strip Token Before Forwarding to Upstream
+
+By default, the token is forwarded to the upstream after successful validation under the `x-forwarded-authorization` header. Set `forwardToken: false` to strip it before proxying.
+
+```yaml
+apiVersion: gateway.api-platform.wso2.com/v1alpha1
+kind: RestApi
+metadata:
+  name: opaque-token-strip-api
+spec:
+  displayName: Opaque Token Strip API
+  version: v1.0
+  context: /opaque-strip/$version
+  upstream:
+    main:
+      url: http://sample-backend:9080/api/v1
+  operations:
+    - method: GET
+      path: /protected
+      policies:
+        - name: opaque-token-auth
+          version: v1
+          params:
+            issuers:
+              - PrimaryIDP
+            forwardToken: false
+```
+
+## Notes
+
+- **Transport security:** Always use HTTPS introspection endpoints. RFC 7662 mandates TLS for the introspection request; `skipTlsVerify` should only be used for testing or trusted internal endpoints.
+- **Caching vs. revocation latency:** A longer `introspectionCacheTtl` reduces load on the authorization server but increases the window during which a revoked token is still accepted. Cached entries never outlive the token's `exp`. Tune the TTL to your revocation requirements.
+- **Provider fallback:** When no `issuers` are configured, every provider is tried in order until one reports the token active. Constrain this with `issuers` (or per-provider `issuer` values) to avoid presenting tokens to unintended authorization servers.
+
+## Related Policies
+
+- **JWT Authentication** — validates self-contained JWT access tokens locally via JWKS providers.
