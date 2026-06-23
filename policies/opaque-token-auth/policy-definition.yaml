@@ -159,36 +159,43 @@ systemParameters:
                 type: boolean
                 default: false
                 description: If true, skip TLS certificate verification for the introspection endpoint. Use with caution, only for testing or trusted internal endpoints.
+      "wso2/defaultValue": "${config.policy_configurations.opaquetokenauth_v1.introspectionproviders}"
 
     introspectionCacheTtl:
       type: string
       description: Duration to cache active introspection responses (e.g., "60s"). Cached entries never outlive the token's `exp`.
       default: "60s"
+      "wso2/defaultValue": "${config.policy_configurations.opaquetokenauth_v1.introspectioncachettl}"
 
     introspectionTimeout:
       type: string
       description: Timeout for each introspection HTTP request, e.g., "5s".
       default: "5s"
+      "wso2/defaultValue": "${config.policy_configurations.opaquetokenauth_v1.introspectiontimeout}"
 
     introspectionRetryCount:
       type: integer
       description: Number of retries for an introspection request on transient failures.
       default: 2
+      "wso2/defaultValue": "${config.policy_configurations.opaquetokenauth_v1.introspectionretrycount}"
 
     introspectionRetryInterval:
       type: string
       description: Interval between introspection retries, e.g., "1s".
       default: "1s"
+      "wso2/defaultValue": "${config.policy_configurations.opaquetokenauth_v1.introspectionretryinterval}"
 
     leeway:
       type: string
       description: Clock skew allowance for local exp/nbf re-checks, e.g., "30s".
       default: "30s"
+      "wso2/defaultValue": "${config.policy_configurations.opaquetokenauth_v1.leeway}"
 
     authHeaderScheme:
       type: string
       description: Expected scheme prefix in the authorization header (e.g., "Bearer"). If set, the scheme is enforced; if omitted, raw header values are accepted or known schemes stripped.
       default: Bearer
+      "wso2/defaultValue": "${config.policy_configurations.opaquetokenauth_v1.authheaderscheme}"
 
     headerName:
       type: string
@@ -196,20 +203,24 @@ systemParameters:
       pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
       description: Header name to extract the token from (default "Authorization").
       default: Authorization
+      "wso2/defaultValue": "${config.policy_configurations.opaquetokenauth_v1.headername}"
 
     onFailureStatusCode:
       type: integer
       description: HTTP status code to return on authentication failure (401 for Unauthorized, 403 for Forbidden).
       default: 401
+      "wso2/defaultValue": "${config.policy_configurations.opaquetokenauth_v1.onfailurestatuscode}"
 
     errorMessageFormat:
       type: string
       description: Format of the error response on validation failure. Supported values are "json", "plain", or "minimal".
       default: json
+      "wso2/defaultValue": "${config.policy_configurations.opaquetokenauth_v1.errormessageformat}"
 
     errorMessage:
       type: string
       description: Custom error message to include in the response body on authentication failure.
       default: "Authentication failed"
+      "wso2/defaultValue": "${config.policy_configurations.opaquetokenauth_v1.errormessage}"
 
   required: ["introspectionProviders"]

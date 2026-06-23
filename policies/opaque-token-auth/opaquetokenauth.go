@@ -31,6 +31,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	policy "github.com/wso2/api-platform/sdk/core/policy/v1alpha2"
@@ -64,6 +65,12 @@ type OpaqueTokenAuthPolicy struct {
 	// The SDK cache is constructed with no TTL (entries are bounded by their own
 	// expiresAt, which is min(configured TTL, token exp)) and an LRU size cap.
 	cache cache.Cache[*cachedIntrospection]
+
+	// provMu guards provHash and providers so they are rebuilt only when the
+	// introspectionProviders config actually changes (typically once, at startup).
+	provMu    sync.RWMutex
+	provHash  string
+	providers []*IntrospectionProvider
 }
 
 // cachedIntrospection holds an active introspection result with its expiry.
@@ -75,15 +82,15 @@ type cachedIntrospection struct {
 // IntrospectionProvider describes an authorization server's introspection
 // endpoint and how the gateway authenticates itself to it.
 type IntrospectionProvider struct {
-	Name          string      // Unique provider name (referenced by user `issuers`)
-	Issuer        string      // Optional issuer value (also matchable via `issuers`)
-	URI           string      // RFC 7662 introspection endpoint URL
-	ClientID      string      // OAuth2 client id for client authentication
-	ClientSecret  string      // OAuth2 client secret for client authentication
-	AuthStyle     string      // "basic" (client_secret_basic) | "post" (client_secret_post)
-	BearerToken   string      // Static bearer token alternative to client credentials
-	TokenTypeHint string      // RFC 7662 token_type_hint (default "access_token")
-	tlsConfig     *tls.Config // Cached TLS config (custom CA / skip verify)
+	Name          string           // Unique provider name (referenced by user `issuers`)
+	Issuer        string           // Optional issuer value (also matchable via `issuers`)
+	URI           string           // RFC 7662 introspection endpoint URL
+	ClientID      string           // OAuth2 client id for client authentication
+	ClientSecret  string           // OAuth2 client secret for client authentication
+	AuthStyle     string           // "basic" (client_secret_basic) | "post" (client_secret_post)
+	BearerToken   string           // Static bearer token alternative to client credentials
+	TokenTypeHint string           // RFC 7662 token_type_hint (default "access_token")
+	httpTransport *http.Transport  // Reused across requests for TCP connection pooling; nil = DefaultTransport
 }
 
 // IntrospectionResult is the RFC 7662 introspection response. Typed fields cover
@@ -160,7 +167,7 @@ func (p *OpaqueTokenAuthPolicy) OnRequestHeaders(ctx context.Context, reqCtx *po
 		authHeaderScheme = userAuthHeaderPrefix
 	}
 
-	providers, err := parseIntrospectionProviders(params)
+	providers, err := p.getProviders(params)
 	if err != nil {
 		slog.Debug("Opaque Token Auth Policy: Failed to parse introspection providers", "error", err)
 		return p.handleAuthFailureHeaders(reqCtx.SharedContext, onFailureStatusCode, errorMessageFormat, errorMessage, fmt.Sprintf("invalid introspection configuration: %v", err))
@@ -329,8 +336,8 @@ func (p *OpaqueTokenAuthPolicy) doIntrospect(ctx context.Context, token string, 
 	}
 
 	client := &http.Client{Timeout: timeout}
-	if provider.tlsConfig != nil {
-		client.Transport = &http.Transport{TLSClientConfig: provider.tlsConfig}
+	if provider.httpTransport != nil {
+		client.Transport = provider.httpTransport
 	}
 
 	resp, err := client.Do(req)
@@ -508,12 +515,51 @@ func parseIntrospectionProviders(params map[string]interface{}) ([]*Introspectio
 			if err != nil {
 				return nil, fmt.Errorf("provider %q: %w", name, err)
 			}
-			provider.tlsConfig = tlsConfig
+			provider.httpTransport = &http.Transport{TLSClientConfig: tlsConfig}
 		}
 
 		providers = append(providers, provider)
 	}
 	return providers, nil
+}
+
+// getProviders returns the parsed provider list, rebuilding it only when the
+// introspectionProviders config has changed. Rebuilds are rare (typically once,
+// at startup); all other calls return the cached slice under a read lock.
+func (p *OpaqueTokenAuthPolicy) getProviders(params map[string]interface{}) ([]*IntrospectionProvider, error) {
+	h := configHash(params["introspectionProviders"])
+
+	p.provMu.RLock()
+	if h == p.provHash {
+		providers := p.providers
+		p.provMu.RUnlock()
+		return providers, nil
+	}
+	p.provMu.RUnlock()
+
+	providers, err := parseIntrospectionProviders(params)
+	if err != nil {
+		return nil, err
+	}
+
+	p.provMu.Lock()
+	// Re-check: another goroutine may have already updated while we were parsing.
+	if h != p.provHash {
+		p.provHash = h
+		p.providers = providers
+	} else {
+		providers = p.providers
+	}
+	p.provMu.Unlock()
+	return providers, nil
+}
+
+// configHash returns a hex SHA-256 of the JSON-marshalled value, used to detect
+// introspectionProviders config changes without a deep equality check.
+func configHash(v interface{}) string {
+	b, _ := json.Marshal(v)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 // selectProviders narrows the provider list by the user-supplied issuers (matched
