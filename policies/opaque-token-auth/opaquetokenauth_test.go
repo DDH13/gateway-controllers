@@ -19,7 +19,10 @@ package opaquetokenauth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -33,7 +36,7 @@ import (
 
 func newPolicy() *OpaqueTokenAuthPolicy {
 	return &OpaqueTokenAuthPolicy{
-		cache: cache.NewInMemoryCache[*cachedIntrospection](cacheName, cacheMaxSize, 0, cache.LRUEvictionPolicy),
+		cache: cache.NewInMemoryCache[*cachedIntrospection](cacheName, cacheMaxSize, 0, cache.LRUEvictionPolicy, slog.Default()),
 	}
 }
 
@@ -146,6 +149,34 @@ func TestActiveTokenSucceeds(t *testing.T) {
 	}
 	if ac.Properties["org"] != "acme" {
 		t.Errorf("Properties[org] = %q, want acme", ac.Properties["org"])
+	}
+}
+
+func TestTokenIdIsTokenSha256(t *testing.T) {
+	srv := newServer(t, activeResponder(map[string]interface{}{"active": true, "sub": "u", "jti": "ignored-jti"}))
+	params := baseParams(provider("idp", srv.URL, nil))
+
+	reqCtx, action := execute(t, newPolicy(), params, bearerHeader("opaque-xyz"))
+	assertSuccess(t, reqCtx, action)
+
+	want := sha256.Sum256([]byte("opaque-xyz"))
+	if got := reqCtx.AuthContext.TokenId; got != hex.EncodeToString(want[:]) {
+		t.Errorf("TokenId = %q, want sha256(token) %q", got, hex.EncodeToString(want[:]))
+	}
+}
+
+func TestTokenIdDiffersPerToken(t *testing.T) {
+	srv := newServer(t, activeResponder(map[string]interface{}{"active": true, "sub": "u"}))
+	params := baseParams(provider("idp", srv.URL, nil))
+	p := newPolicy()
+
+	reqCtxA, actionA := execute(t, p, params, bearerHeader("token-A"))
+	assertSuccess(t, reqCtxA, actionA)
+	reqCtxB, actionB := execute(t, p, params, bearerHeader("token-B"))
+	assertSuccess(t, reqCtxB, actionB)
+
+	if reqCtxA.AuthContext.TokenId == reqCtxB.AuthContext.TokenId {
+		t.Errorf("TokenId should differ per token, both = %q", reqCtxA.AuthContext.TokenId)
 	}
 }
 

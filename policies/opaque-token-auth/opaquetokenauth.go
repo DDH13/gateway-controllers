@@ -105,7 +105,7 @@ type IntrospectionResult struct {
 }
 
 var ins = &OpaqueTokenAuthPolicy{
-	cache: cache.NewInMemoryCache[*cachedIntrospection](cacheName, cacheMaxSize, 0, cache.LRUEvictionPolicy),
+	cache: cache.NewInMemoryCache[*cachedIntrospection](cacheName, cacheMaxSize, 0, cache.LRUEvictionPolicy, slog.Default()),
 }
 
 // GetPolicy is the v1alpha2 factory entry point (loaded by v1alpha2 kernels).
@@ -254,7 +254,7 @@ func (p *OpaqueTokenAuthPolicy) OnRequestHeaders(ctx context.Context, reqCtx *po
 	}
 
 	slog.Debug("Opaque Token Auth Policy: All validations passed, authentication successful")
-	return p.handleAuthSuccessHeaders(reqCtx.SharedContext, result, userClaimMappings, userIdClaim, headerName, authHeader, forwardToken, forwardedTokenHeader)
+	return p.handleAuthSuccessHeaders(reqCtx.SharedContext, result, token, userClaimMappings, userIdClaim, headerName, authHeader, forwardToken, forwardedTokenHeader)
 }
 
 // introspect returns the (possibly cached) introspection result for a token at a
@@ -362,7 +362,7 @@ func (p *OpaqueTokenAuthPolicy) doIntrospect(ctx context.Context, token string, 
 
 // handleAuthSuccessHeaders populates AuthContext and request-header modifications
 // after a successful introspection.
-func (p *OpaqueTokenAuthPolicy) handleAuthSuccessHeaders(shared *policy.SharedContext, result *IntrospectionResult, claimMappings map[string]string,
+func (p *OpaqueTokenAuthPolicy) handleAuthSuccessHeaders(shared *policy.SharedContext, result *IntrospectionResult, token string, claimMappings map[string]string,
 	userIdClaim string, headerName string, authHeaderValue string, forwardToken bool, forwardedTokenHeader string) policy.RequestHeaderAction {
 
 	subject := result.Sub
@@ -383,8 +383,12 @@ func (p *OpaqueTokenAuthPolicy) handleAuthSuccessHeaders(shared *policy.SharedCo
 		Audience:      parseAudience(result.raw["aud"]),
 		Scopes:        buildScopesMap(result.raw),
 		CredentialID:  result.ClientID,
-		Properties:    buildProperties(result.raw),
-		Previous:      shared.AuthContext,
+		// TokenId is a SHA-256 fingerprint of the opaque token: a stable, globally
+		// unique, non-reversible identifier (the raw token is a bearer secret and must
+		// not be propagated). Downstream policies such as backend-jwt use it as a cache key.
+		TokenId:    tokenFingerprint(token),
+		Properties: buildProperties(result.raw),
+		Previous:   shared.AuthContext,
 	}
 
 	modifications := policy.UpstreamRequestHeaderModifications{
@@ -556,6 +560,14 @@ func introspectionCacheKey(uri, token string) string {
 	h.Write([]byte{0})
 	h.Write([]byte(token))
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// tokenFingerprint returns a hex SHA-256 of the token, used as AuthContext.TokenId.
+// Unlike introspectionCacheKey it is not provider-scoped, so the same token yields
+// the same downstream cache key regardless of which provider validated it.
+func tokenFingerprint(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
 }
 
 // ─── Generic helpers ─────────────────────────────────────────────────────────
