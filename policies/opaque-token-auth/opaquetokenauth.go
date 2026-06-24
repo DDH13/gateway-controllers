@@ -47,15 +47,18 @@ const (
 	cacheName = "opaque-token-introspection"
 
 	// cacheMaxSize bounds the number of cached introspection results (LRU eviction).
-	cacheMaxSize = 10000
+	cacheMaxSize = 100000
 )
 
 // standardIntrospectionClaims lists RFC 7662 introspection response members that
-// are surfaced as typed AuthContext fields and therefore excluded from Properties.
+// are surfaced as typed AuthContext fields or are status-only booleans, excluded
+// from Properties. username and token_type are intentionally omitted so they flow
+// into Properties — WSO2/Asgardeo always returns username, and jwt-auth does not
+// exclude these members either.
 var standardIntrospectionClaims = map[string]bool{
 	"active": true, "scope": true, "scp": true, "client_id": true,
-	"username": true, "token_type": true, "exp": true, "iat": true,
-	"nbf": true, "sub": true, "aud": true, "iss": true, "jti": true,
+	"exp": true, "iat": true, "nbf": true,
+	"sub": true, "aud": true, "iss": true, "jti": true,
 }
 
 // OpaqueTokenAuthPolicy validates opaque OAuth 2.0 access tokens via RFC 7662
@@ -144,12 +147,14 @@ func (p *OpaqueTokenAuthPolicy) OnRequestHeaders(ctx context.Context, reqCtx *po
 	errorMessage := getStringParam(params, "errorMessage", "Authentication failed")
 	leewayStr := getStringParam(params, "leeway", "30s")
 	cacheTtlStr := getStringParam(params, "introspectionCacheTtl", "60s")
+	negativeCacheTtlStr := getStringParam(params, "introspectionNegativeCacheTtl", "30s")
 	timeoutStr := getStringParam(params, "introspectionTimeout", "5s")
 	retryCount := getIntParam(params, "introspectionRetryCount", 2)
 	retryIntervalStr := getStringParam(params, "introspectionRetryInterval", "1s")
 
 	leeway := parseDurationOrDefault(leewayStr, 30*time.Second)
 	cacheTtl := parseDurationOrDefault(cacheTtlStr, 60*time.Second)
+	negativeCacheTtl := parseDurationOrDefault(negativeCacheTtlStr, 30*time.Second)
 	timeout := parseDurationOrDefault(timeoutStr, 5*time.Second)
 	retryInterval := parseDurationOrDefault(retryIntervalStr, time.Second)
 
@@ -201,7 +206,7 @@ func (p *OpaqueTokenAuthPolicy) OnRequestHeaders(ctx context.Context, reqCtx *po
 	var result *IntrospectionResult
 	var lastErr error
 	for _, provider := range selected {
-		res, err := p.introspect(ctx, token, provider, cacheTtl, timeout, retryCount, retryInterval)
+		res, err := p.introspect(ctx, token, provider, cacheTtl, negativeCacheTtl, timeout, retryCount, retryInterval)
 		if err != nil {
 			slog.Debug("Opaque Token Auth Policy: Introspection call failed", "provider", provider.Name, "error", err)
 			lastErr = err
@@ -266,8 +271,10 @@ func (p *OpaqueTokenAuthPolicy) OnRequestHeaders(ctx context.Context, reqCtx *po
 }
 
 // introspect returns the (possibly cached) introspection result for a token at a
-// provider. Only active responses are cached, bounded by min(TTL, token exp).
-func (p *OpaqueTokenAuthPolicy) introspect(ctx context.Context, token string, provider *IntrospectionProvider, cacheTtl, timeout time.Duration, retryCount int, retryInterval time.Duration) (*IntrospectionResult, error) {
+// provider. Active responses are cached bounded by min(cacheTtl, token exp).
+// Inactive (active:false) HTTP-200 responses are cached for negativeCacheTtl when
+// > 0; transport errors and non-200 responses are never cached.
+func (p *OpaqueTokenAuthPolicy) introspect(ctx context.Context, token string, provider *IntrospectionProvider, cacheTtl, negativeCacheTtl, timeout time.Duration, retryCount int, retryInterval time.Duration) (*IntrospectionResult, error) {
 	if retryCount < 0 {
 		return nil, fmt.Errorf("invalid introspection retry count: %d", retryCount)
 	}
@@ -285,16 +292,19 @@ func (p *OpaqueTokenAuthPolicy) introspect(ctx context.Context, token string, pr
 	for attempt := 0; attempt <= retryCount; attempt++ {
 		result, err := p.doIntrospect(ctx, token, provider, timeout)
 		if err == nil {
+			var expiresAt time.Time
 			if result.Active {
-				expiresAt := time.Now().Add(cacheTtl)
+				expiresAt = time.Now().Add(cacheTtl)
 				if result.Exp > 0 {
 					if tokenExp := time.Unix(result.Exp, 0); tokenExp.Before(expiresAt) {
 						expiresAt = tokenExp
 					}
 				}
-				if expiresAt.After(time.Now()) {
-					_ = p.cache.Set(ctx, cacheKey, &cachedIntrospection{result: result, expiresAt: expiresAt})
-				}
+			} else if negativeCacheTtl > 0 {
+				expiresAt = time.Now().Add(negativeCacheTtl)
+			}
+			if !expiresAt.IsZero() && expiresAt.After(time.Now()) {
+				_ = p.cache.Set(ctx, cacheKey, &cachedIntrospection{result: result, expiresAt: expiresAt})
 			}
 			return result, nil
 		}

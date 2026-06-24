@@ -169,6 +169,12 @@ systemParameters:
       default: "60s"
       "wso2/defaultValue": "${config.policy_configurations.opaquetokenauth_v1.introspectioncachettl}"
 
+    introspectionNegativeCacheTtl:
+      type: string
+      description: Duration to cache inactive (active:false) introspection responses (e.g., "30s"). Set to "0s" to disable. Transport errors and non-200 responses are never negatively cached.
+      default: "30s"
+      "wso2/defaultValue": "${config.policy_configurations.opaquetokenauth_v1.introspectionnegativecachettl}"
+
     introspectionTimeout:
       type: string
       description: Timeout for each introspection HTTP request, e.g., "5s".

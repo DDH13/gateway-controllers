@@ -163,13 +163,15 @@ func TestCacheKeyedPerToken(t *testing.T) {
 	}
 }
 
-func TestInactiveNotCached(t *testing.T) {
+func TestInactiveNotCachedWhenNegativeCacheTtlIsZero(t *testing.T) {
 	var calls int64
 	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&calls, 1)
 		activeResponder(map[string]interface{}{"active": false})(w, r)
 	})
 	params := baseParams(provider("idp", srv.URL, nil))
+	// Explicitly disable negative caching: inactive results must not be cached.
+	params["introspectionNegativeCacheTtl"] = "0s"
 	p := newPolicy()
 
 	for i := 0; i < 2; i++ {
@@ -177,7 +179,7 @@ func TestInactiveNotCached(t *testing.T) {
 		assertFailure(t, reqCtx, action, 401)
 	}
 	if got := atomic.LoadInt64(&calls); got != 2 {
-		t.Errorf("calls = %d, want 2 (inactive results not cached)", got)
+		t.Errorf("calls = %d, want 2 (inactive results not cached when negativeCacheTtl=0)", got)
 	}
 }
 

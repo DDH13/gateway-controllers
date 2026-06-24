@@ -459,3 +459,109 @@ func TestGetPolicy(t *testing.T) {
 		t.Fatalf("GetPolicy returned (%v, %v)", p, err)
 	}
 }
+
+// ─── Negative caching tests ───────────────────────────────────────────────────
+
+func TestNegativeCachingCachesInactiveResponse(t *testing.T) {
+	var hitCount int64
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&hitCount, 1)
+		activeResponder(map[string]interface{}{"active": false})(w, r)
+	})
+	params := baseParams(provider("idp", srv.URL, nil))
+	params["introspectionNegativeCacheTtl"] = "30s"
+
+	p := newPolicy()
+	// First request — cache miss, hits the server.
+	reqCtx1, action1 := execute(t, p, params, bearerHeader("inactive-tok"))
+	assertFailure(t, reqCtx1, action1, 401)
+
+	// Second request with same token — should be served from negative cache.
+	reqCtx2, action2 := execute(t, p, params, bearerHeader("inactive-tok"))
+	assertFailure(t, reqCtx2, action2, 401)
+
+	if got := atomic.LoadInt64(&hitCount); got != 1 {
+		t.Errorf("introspection endpoint called %d times, want 1 (negative cache should serve second request)", got)
+	}
+}
+
+func TestNegativeCachingDisabledWhenZero(t *testing.T) {
+	var hitCount int64
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&hitCount, 1)
+		activeResponder(map[string]interface{}{"active": false})(w, r)
+	})
+	params := baseParams(provider("idp", srv.URL, nil))
+	params["introspectionNegativeCacheTtl"] = "0s"
+
+	p := newPolicy()
+	execute(t, p, params, bearerHeader("inactive-tok"))
+	execute(t, p, params, bearerHeader("inactive-tok"))
+
+	if got := atomic.LoadInt64(&hitCount); got != 2 {
+		t.Errorf("introspection endpoint called %d times, want 2 (negative cache disabled)", got)
+	}
+}
+
+func TestNegativeCachingNotAppliedOnTransportError(t *testing.T) {
+	// Use a server that closes connections immediately to simulate a transport error.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Close with a non-200 status to trigger the "status != 200" error path.
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+
+	params := baseParams(provider("idp", srv.URL, nil))
+	params["introspectionNegativeCacheTtl"] = "30s"
+	params["introspectionRetryCount"] = 0
+
+	p := newPolicy()
+	// Both requests should hit the server — errors must not be negatively cached.
+	var serverCalls int64
+	srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&serverCalls, 1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+
+	execute(t, p, params, bearerHeader("some-tok"))
+	execute(t, p, params, bearerHeader("some-tok"))
+
+	if got := atomic.LoadInt64(&serverCalls); got != 2 {
+		t.Errorf("introspection endpoint called %d times, want 2 (errors must not be cached)", got)
+	}
+}
+
+// ─── Identity claims surfaced in Properties ───────────────────────────────────
+
+func TestUsernameAndWSO2ClaimsInProperties(t *testing.T) {
+	srv := newServer(t, activeResponder(map[string]interface{}{
+		"active":     true,
+		"sub":        "550e8400-e29b-41d4-a716-446655440000",
+		"username":   "alice@example.com",
+		"token_type": "Bearer",
+		"org_id":     "org-123",
+		"org_handle": "acme-corp",
+		"aut":        "APPLICATION_USER",
+	}))
+	params := baseParams(provider("idp", srv.URL, nil))
+
+	reqCtx, action := execute(t, newPolicy(), params, bearerHeader("tok"))
+	assertSuccess(t, reqCtx, action)
+
+	ac := reqCtx.AuthContext
+	if ac.Properties["username"] != "alice@example.com" {
+		t.Errorf("Properties[username] = %q, want alice@example.com", ac.Properties["username"])
+	}
+	if ac.Properties["token_type"] != "Bearer" {
+		t.Errorf("Properties[token_type] = %q, want Bearer", ac.Properties["token_type"])
+	}
+	if ac.Properties["org_handle"] != "acme-corp" {
+		t.Errorf("Properties[org_handle] = %q, want acme-corp", ac.Properties["org_handle"])
+	}
+	if ac.Properties["aut"] != "APPLICATION_USER" {
+		t.Errorf("Properties[aut] = %q, want APPLICATION_USER", ac.Properties["aut"])
+	}
+	if ac.Properties["org_id"] != "org-123" {
+		t.Errorf("Properties[org_id] = %q, want org-123", ac.Properties["org_id"])
+	}
+}
