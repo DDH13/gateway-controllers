@@ -123,6 +123,15 @@ systemParameters:
           issuer:
             type: string
             description: Optional issuer value associated with this provider (also matchable via `user.issuers`).
+          tokenPattern:
+            type: string
+            description: >-
+              Optional regular expression matched against the raw token string.
+              When set, only tokens that match are sent to this provider for
+              introspection. Providers with no pattern match all tokens. Use
+              this to route tokens to the correct authorization server based on
+              their format (e.g. a UUID prefix for one IdP, an "opaque_" prefix
+              for another).
           introspection:
             type: object
             additionalProperties: false

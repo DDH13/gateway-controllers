@@ -25,6 +25,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"sync/atomic"
 	"testing"
 
@@ -562,6 +563,131 @@ func TestNegativeCachingNotAppliedOnTransportError(t *testing.T) {
 	if got := atomic.LoadInt64(&serverCalls); got != 2 {
 		t.Errorf("introspection endpoint called %d times, want 2 (errors must not be cached)", got)
 	}
+}
+
+// ─── Token pattern routing ────────────────────────────────────────────────────
+
+func TestTokenPatternRoutesToMatchingProvider(t *testing.T) {
+	var localCount, asgardeoCount int64
+	localSrv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&localCount, 1)
+		activeResponder(map[string]interface{}{"active": true, "sub": "local-user"})(w, r)
+	})
+	asgardeoSrv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&asgardeoCount, 1)
+		activeResponder(map[string]interface{}{"active": true, "sub": "asgardeo-user"})(w, r)
+	})
+
+	localProvider := provider("local-mock", localSrv.URL, nil)
+	localProvider["tokenPattern"] = "^opaque_"
+	asgardeoProvider := provider("asgardeo", asgardeoSrv.URL, nil)
+	asgardeoProvider["tokenPattern"] = "^[0-9a-f]{8}-" // UUID-like prefix
+
+	params := baseParams(localProvider, asgardeoProvider)
+
+	t.Run("opaque prefix routes to local", func(t *testing.T) {
+		atomic.StoreInt64(&localCount, 0)
+		atomic.StoreInt64(&asgardeoCount, 0)
+		reqCtx, action := execute(t, newPolicy(), params, bearerHeader("opaque_abc123"))
+		assertSuccess(t, reqCtx, action)
+		if reqCtx.AuthContext.Subject != "local-user" {
+			t.Errorf("Subject = %q, want local-user", reqCtx.AuthContext.Subject)
+		}
+		if atomic.LoadInt64(&localCount) != 1 {
+			t.Errorf("local provider calls = %d, want 1", localCount)
+		}
+		if atomic.LoadInt64(&asgardeoCount) != 0 {
+			t.Errorf("asgardeo provider should not be called, got %d calls", asgardeoCount)
+		}
+	})
+
+	t.Run("UUID prefix routes to asgardeo", func(t *testing.T) {
+		atomic.StoreInt64(&localCount, 0)
+		atomic.StoreInt64(&asgardeoCount, 0)
+		reqCtx, action := execute(t, newPolicy(), params, bearerHeader("a1b2c3d4-e5f6-7890-abcd-ef1234567890"))
+		assertSuccess(t, reqCtx, action)
+		if reqCtx.AuthContext.Subject != "asgardeo-user" {
+			t.Errorf("Subject = %q, want asgardeo-user", reqCtx.AuthContext.Subject)
+		}
+		if atomic.LoadInt64(&localCount) != 0 {
+			t.Errorf("local provider should not be called, got %d calls", localCount)
+		}
+		if atomic.LoadInt64(&asgardeoCount) != 1 {
+			t.Errorf("asgardeo provider calls = %d, want 1", asgardeoCount)
+		}
+	})
+}
+
+func TestTokenPatternNoMatchFails(t *testing.T) {
+	srv := newServer(t, activeResponder(map[string]interface{}{"active": true, "sub": "u"}))
+	p := provider("idp", srv.URL, nil)
+	p["tokenPattern"] = "^opaque_" // only matches tokens starting with "opaque_"
+	params := baseParams(p)
+
+	reqCtx, action := execute(t, newPolicy(), params, bearerHeader("jwt.does.not.match"))
+	assertFailure(t, reqCtx, action, 401)
+}
+
+func TestTokenPatternAbsentMatchesAll(t *testing.T) {
+	srv := newServer(t, activeResponder(map[string]interface{}{"active": true, "sub": "u"}))
+	// No tokenPattern set — provider should accept any token (backward compat).
+	params := baseParams(provider("idp", srv.URL, nil))
+
+	reqCtx, action := execute(t, newPolicy(), params, bearerHeader("any-token-shape"))
+	assertSuccess(t, reqCtx, action)
+}
+
+func TestTokenPatternInvalidRegexFails(t *testing.T) {
+	srv := newServer(t, activeResponder(map[string]interface{}{"active": true}))
+	p := provider("idp", srv.URL, nil)
+	p["tokenPattern"] = "[invalid(regex"
+	params := baseParams(p)
+
+	// Invalid regex → parseIntrospectionProviders errors → auth failure.
+	reqCtx, action := execute(t, newPolicy(), params, bearerHeader("tok"))
+	assertFailure(t, reqCtx, action, 401)
+}
+
+// TestFilterProvidersByToken exercises the helper directly.
+func TestFilterProvidersByToken(t *testing.T) {
+	withPattern := func(pattern string) *IntrospectionProvider {
+		re, _ := regexp.Compile(pattern)
+		return &IntrospectionProvider{TokenPattern: pattern, tokenRegexp: re}
+	}
+	noPattern := &IntrospectionProvider{}
+
+	all := []*IntrospectionProvider{
+		withPattern("^opaque_"),
+		withPattern("^uuid-"),
+		noPattern,
+	}
+
+	t.Run("opaque token selects matching + no-pattern", func(t *testing.T) {
+		got := filterProvidersByToken(all, "opaque_abc")
+		if len(got) != 2 {
+			t.Fatalf("got %d providers, want 2", len(got))
+		}
+		if got[0].TokenPattern != "^opaque_" {
+			t.Errorf("first provider pattern = %q, want ^opaque_", got[0].TokenPattern)
+		}
+		if got[1].TokenPattern != "" {
+			t.Errorf("second provider should be the no-pattern one")
+		}
+	})
+
+	t.Run("unmatched token selects only no-pattern", func(t *testing.T) {
+		got := filterProvidersByToken(all, "other-token")
+		if len(got) != 1 || got[0].TokenPattern != "" {
+			t.Errorf("got %d providers, want only the no-pattern provider", len(got))
+		}
+	})
+
+	t.Run("all have patterns and none match returns empty", func(t *testing.T) {
+		got := filterProvidersByToken(all[:2], "other-token")
+		if len(got) != 0 {
+			t.Errorf("got %d providers, want 0", len(got))
+		}
+	})
 }
 
 // ─── Identity claims surfaced in Properties ───────────────────────────────────

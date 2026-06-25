@@ -30,6 +30,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -88,12 +89,14 @@ type cachedIntrospection struct {
 type IntrospectionProvider struct {
 	Name          string           // Unique provider name (referenced by user `issuers`)
 	Issuer        string           // Optional issuer value (also matchable via `issuers`)
+	TokenPattern  string           // Optional regex; when set, only tokens matching it are sent to this provider
 	URI           string           // RFC 7662 introspection endpoint URL
 	ClientID      string           // OAuth2 client id for client authentication
 	ClientSecret  string           // OAuth2 client secret for client authentication
 	AuthStyle     string           // "basic" (client_secret_basic) | "post" (client_secret_post)
 	BearerToken   string           // Static bearer token alternative to client credentials
 	TokenTypeHint string           // RFC 7662 token_type_hint (default "access_token")
+	tokenRegexp   *regexp.Regexp   // Compiled TokenPattern; nil when TokenPattern is ""
 	httpTransport *http.Transport  // Reused across requests for TCP connection pooling; nil = DefaultTransport
 }
 
@@ -200,6 +203,12 @@ func (p *OpaqueTokenAuthPolicy) OnRequestHeaders(ctx context.Context, reqCtx *po
 	if token == "" {
 		slog.Debug("Opaque Token Auth Policy: Failed to extract token from authorization header", "authHeaderScheme", authHeaderScheme)
 		return p.handleAuthFailureHeaders(reqCtx.SharedContext, onFailureStatusCode, errorMessageFormat, errorMessage, "invalid authorization header format")
+	}
+
+	selected = filterProvidersByToken(selected, token)
+	if len(selected) == 0 {
+		slog.Debug("Opaque Token Auth Policy: No provider tokenPattern matches token")
+		return p.handleAuthFailureHeaders(reqCtx.SharedContext, onFailureStatusCode, errorMessageFormat, errorMessage, "no introspection provider matches token pattern")
 	}
 
 	// Introspect against each selected provider until one reports the token active.
@@ -525,15 +534,27 @@ func parseIntrospectionProviders(params map[string]interface{}) ([]*Introspectio
 			continue
 		}
 
+		tokenPattern := getString(pm["tokenPattern"])
+		var tokenRegexp *regexp.Regexp
+		if tokenPattern != "" {
+			compiled, err := regexp.Compile(tokenPattern)
+			if err != nil {
+				return nil, fmt.Errorf("provider %q: invalid tokenPattern: %w", name, err)
+			}
+			tokenRegexp = compiled
+		}
+
 		provider := &IntrospectionProvider{
 			Name:          name,
 			Issuer:        getString(pm["issuer"]),
+			TokenPattern:  tokenPattern,
 			URI:           uri,
 			ClientID:      getString(introspection["clientId"]),
 			ClientSecret:  getString(introspection["clientSecret"]),
 			AuthStyle:     getString(introspection["authStyle"]),
 			BearerToken:   getString(introspection["bearerToken"]),
 			TokenTypeHint: getStringOrDefault(introspection["tokenTypeHint"], "access_token"),
+			tokenRegexp:   tokenRegexp,
 		}
 
 		certPath := getString(introspection["certificatePath"])
@@ -607,6 +628,18 @@ func selectProviders(providers []*IntrospectionProvider, issuers []string) []*In
 		}
 	}
 	return selected
+}
+
+// filterProvidersByToken drops providers whose tokenPattern does not match token.
+// Providers with no pattern (tokenRegexp == nil) match all tokens.
+func filterProvidersByToken(providers []*IntrospectionProvider, token string) []*IntrospectionProvider {
+	var out []*IntrospectionProvider
+	for _, p := range providers {
+		if p.tokenRegexp == nil || p.tokenRegexp.MatchString(token) {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // buildTLSConfig builds a TLS config from an optional custom CA certificate file
