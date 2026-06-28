@@ -114,6 +114,15 @@ type RateLimitPolicy struct {
 	includeRetry   bool
 }
 
+// redisBacked reports whether the backend talks to Redis — the synchronous "redis"
+// backend or the local-first "redis-local-async" backend. The request/response error
+// paths use this so failureMode=open is honored for BOTH: redis-local-async inherits the
+// synchronous cost-extraction methods (GetAvailable/ConsumeOrClampN/ConsumeN), which can
+// still return Redis errors that must fail open when configured to.
+func (p *RateLimitPolicy) redisBacked() bool {
+	return p.backend == "redis" || p.backend == "redis-local-async"
+}
+
 // GetPolicy is the v1alpha2 factory entry point (loaded by v1alpha2 kernels).
 func GetPolicy(
 	metadata policy.PolicyMetadata,
@@ -190,54 +199,69 @@ func GetPolicy(
 		}
 	}
 
-	// Initialize limiters for each quota based on backend
+	// Initialize limiters for each quota based on backend.
+	// "redis"             -> shared Redis counter, one limiter per quota (no local cache).
+	// "redis-local-async" -> local-first counting + async Redis reconcile; needs the Redis
+	//                        client AND the shared limiter cache (holds a flusher goroutine).
+	// "memory"            -> per-replica counting via the shared limiter cache.
 	var redisClient *redis.Client
 	redisFailOpen := true
-	var baseCacheKey string // Set for memory backend to track limiters
+	redisKeyPrefix := getStringParam(params, "redis.keyPrefix", "ratelimit:v1:")
+	localSyncInterval := getDurationParam(params, "local.syncInterval", 50*time.Millisecond)
+	localFlushWorkers := getIntParam(params, "local.flushWorkers", 0)
+	localMaxPipelineCommands := getIntParam(params, "local.maxPipelineCommands", 0)
+	localMaxLocalEntries := getIntParam(params, "local.maxLocalEntries", 0)
+	var baseCacheKey string // Set for cache-backed backends (memory, redis-local-async)
+
+	usesRedis := backend == "redis" || backend == "redis-local-async"
 
 	slog.Debug("Initializing rate limiter backend",
 		"backend", backend,
 		"algorithm", algorithm,
 		"quotaCount", len(quotas))
 
-	if backend == "redis" {
+	if usesRedis {
 		// Parse Redis configuration
 		redisHost := getStringParam(params, "redis.host", "localhost")
 		redisPort := getIntParam(params, "redis.port", 6379)
 		redisPassword := getStringParam(params, "redis.password", "")
 		redisUsername := getStringParam(params, "redis.username", "")
 		redisDB := getIntParam(params, "redis.db", 0)
-		keyPrefix := getStringParam(params, "redis.keyPrefix", "ratelimit:v1:")
 		failureMode := getStringParam(params, "redis.failureMode", "open")
 		redisFailOpen = (failureMode == "open")
 
 		connTimeout := getDurationParam(params, "redis.connectionTimeout", 5*time.Second)
 		readTimeout := getDurationParam(params, "redis.readTimeout", 3*time.Second)
 		writeTimeout := getDurationParam(params, "redis.writeTimeout", 3*time.Second)
+		poolSize := getIntParam(params, "redis.poolSize", 0)
 
-		// Create Redis client
-		redisClient = redis.NewClient(&redis.Options{
-			Addr: fmt.Sprintf("%s:%d",
-				redisHost, redisPort),
+		// Get-or-create the process-wide shared client for this connection config.
+		// Sharing one pool across all policy instances (and reloads) avoids the
+		// per-instance client/connection explosion. Ping happens once, on creation.
+		var created bool
+		var pingErr error
+		redisClient, created, pingErr = getOrCreateRedisClient(&redis.Options{
+			Addr:         fmt.Sprintf("%s:%d", redisHost, redisPort),
 			Username:     redisUsername,
 			Password:     redisPassword,
 			DB:           redisDB,
 			DialTimeout:  connTimeout,
 			ReadTimeout:  readTimeout,
 			WriteTimeout: writeTimeout,
-		})
-
-		// Test connection (fail-fast if configured to fail closed)
-		ctx, cancel := context.WithTimeout(context.Background(), connTimeout)
-		defer cancel()
-		if err := redisClient.Ping(ctx).Err(); err != nil {
+			PoolSize:     poolSize,
+		}, connTimeout)
+		// Fail-fast only when we created the client and it failed to connect; a reused
+		// client is assumed healthy (go-redis reconnects lazily).
+		if created && pingErr != nil {
 			if !redisFailOpen {
-				return nil, fmt.Errorf("redis connection failed and failureMode=closed: %w", err)
+				return nil, fmt.Errorf("redis connection failed and failureMode=closed: %w", pingErr)
 			}
-			slog.Warn("Redis connection failed but failureMode=open", "error", err)
+			slog.Warn("Redis connection failed but failureMode=open", "error", pingErr)
 		}
+	}
 
-		// Create a limiter per quota
+	if backend == "redis" {
+		// Create a limiter per quota (Redis holds the state; no local cache needed)
 		for i := range quotas {
 			q := &quotas[i]
 			limiterLimits := make([]limiter.LimitConfig, len(q.Limits))
@@ -254,7 +278,7 @@ func GetPolicy(
 				Limits:          limiterLimits,
 				Backend:         backend,
 				RedisClient:     redisClient,
-				KeyPrefix:       keyPrefix,
+				KeyPrefix:       redisKeyPrefix,
 				CleanupInterval: 0, // Not used for Redis
 			})
 			if err != nil {
@@ -268,9 +292,11 @@ func GetPolicy(
 			q.Limiter = rlLimiter
 		}
 	} else {
-		// Memory backend - create limiter per quota with caching and automatic cleanup
+		// Cache-backed backends (memory, redis-local-async): create a shared, ref-counted
+		// limiter per quota. redis-local-async holds a per-replica counter + flusher
+		// goroutine, so it MUST be a shared singleton (cached) and Close()d on reload.
 		cleanupInterval := getDurationParam(params, "memory.cleanupInterval", 5*time.Minute)
-		baseCacheKey = getBaseCacheKey(routeName, apiName, algorithm, params)
+		baseCacheKey = getBaseCacheKey(routeName, apiName, algorithm, backend, params)
 
 		// Compute desired quota keys before acquiring lock
 		type quotaInfo struct {
@@ -320,12 +346,27 @@ func GetPolicy(
 					"refCount", entry.refCount)
 			} else {
 				// Create new limiter
-				rlLimiter, err := limiter.CreateLimiter(limiter.Config{
+				limiterConfig := limiter.Config{
 					Algorithm:       algorithm,
 					Limits:          info.limiterLimits,
 					Backend:         backend,
 					CleanupInterval: cleanupInterval,
-				})
+				}
+				// redis-local-async needs the Redis client + key prefix for its async
+				// flush, plus the local tuning (sync interval, fail-open) passed through
+				// AlgorithmConfig.
+				if backend == "redis-local-async" {
+					limiterConfig.RedisClient = redisClient
+					limiterConfig.KeyPrefix = redisKeyPrefix
+					limiterConfig.AlgorithmConfig = map[string]interface{}{
+						"syncInterval":        localSyncInterval,
+						"failOpen":            redisFailOpen,
+						"flushWorkers":        localFlushWorkers,
+						"maxPipelineCommands": localMaxPipelineCommands,
+						"maxLocalEntries":     localMaxLocalEntries,
+					}
+				}
+				rlLimiter, err := limiter.CreateLimiter(limiterConfig)
 				if err != nil {
 					quotaName := q.Name
 					if quotaName == "" {
@@ -1075,7 +1116,7 @@ func getDurationFromQuota(q *QuotaRuntime) time.Duration {
 
 // getBaseCacheKey computes a stable hash key base for caching memory-backed limiters.
 // This includes shared aspects like algorithm, headers config, etc.
-func getBaseCacheKey(routeName, apiName, algorithm string, params map[string]interface{}) string {
+func getBaseCacheKey(routeName, apiName, algorithm, backend string, params map[string]interface{}) string {
 	h := sha256.New()
 
 	h.Write([]byte("route:"))
@@ -1089,6 +1130,26 @@ func getBaseCacheKey(routeName, apiName, algorithm string, params map[string]int
 	h.Write([]byte("algo:"))
 	h.Write([]byte(algorithm))
 	h.Write([]byte("|"))
+
+	// Include backend so a memory and a redis-local-async limiter for the same
+	// route+algorithm get distinct cache entries (both use this cache path).
+	h.Write([]byte("backend:"))
+	h.Write([]byte(backend))
+	h.Write([]byte("|"))
+
+	// For redis-local-async, fold the Redis endpoint and local tuning into the key so a
+	// config reload that changes them rebuilds the cached limiter instead of silently
+	// reusing the old one. (Counts survive in Redis; the coordinator's global settings
+	// are first-registrant-wins regardless.)
+	if backend == "redis-local-async" {
+		h.Write([]byte(fmt.Sprintf("redis:%s/%d|local:%s,w=%d,pipe=%d,max=%d|",
+			getStringParam(params, "redis.host", "localhost"),
+			getIntParam(params, "redis.db", 0),
+			getDurationParam(params, "local.syncInterval", 50*time.Millisecond),
+			getIntParam(params, "local.flushWorkers", 0),
+			getIntParam(params, "local.maxPipelineCommands", 0),
+			getIntParam(params, "local.maxLocalEntries", 0))))
+	}
 
 	// Include memory cleanup interval
 	cleanupInterval := getDurationParam(params, "memory.cleanupInterval", 5*time.Minute)
@@ -1227,7 +1288,7 @@ func (p *RateLimitPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.R
 				if requestCost == 0 {
 					available, err := q.Limiter.GetAvailable(context.Background(), key)
 					if err != nil {
-						if p.backend == "redis" && p.redisFailOpen {
+						if p.redisBacked() && p.redisFailOpen {
 							slog.Warn("Rate limit state lookup failed (fail-open)", "error", err, "quota", quotaName)
 							continue
 						}
@@ -1253,7 +1314,7 @@ func (p *RateLimitPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.R
 				cost := int64(requestCost)
 				result, err := q.Limiter.AllowN(context.Background(), key, cost)
 				if err != nil {
-					if p.backend == "redis" && p.redisFailOpen {
+					if p.redisBacked() && p.redisFailOpen {
 						slog.Warn("Rate limit check failed (fail-open)", "error", err, "quota", quotaName)
 						continue
 					}
@@ -1280,7 +1341,7 @@ func (p *RateLimitPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.R
 				// actual consumption is deferred to OnRequestBody or OnResponse.
 				available, err := q.Limiter.GetAvailable(context.Background(), key)
 				if err != nil {
-					if p.backend == "redis" && p.redisFailOpen {
+					if p.redisBacked() && p.redisFailOpen {
 						slog.Warn("Rate limit pre-check failed (fail-open)", "error", err, "quota", quotaName)
 						continue
 					}
@@ -1315,7 +1376,7 @@ func (p *RateLimitPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.R
 			cost := int64(1)
 			result, err := q.Limiter.AllowN(context.Background(), key, cost)
 			if err != nil {
-				if p.backend == "redis" && p.redisFailOpen {
+				if p.redisBacked() && p.redisFailOpen {
 					slog.Warn("Rate limit check failed (fail-open)", "error", err, "quota", quotaName)
 					continue
 				}
@@ -1525,7 +1586,7 @@ func (p *RateLimitPolicy) OnRequestBody(ctx context.Context, reqCtx *policy.Requ
 					if requestCost == 0 {
 						available, err := q.Limiter.GetAvailable(context.Background(), key)
 						if err != nil {
-							if p.backend == "redis" && p.redisFailOpen {
+							if p.redisBacked() && p.redisFailOpen {
 								slog.Warn("Rate limit state lookup failed (fail-open)", "error", err, "quota", quotaName)
 								continue
 							}
@@ -1552,7 +1613,7 @@ func (p *RateLimitPolicy) OnRequestBody(ctx context.Context, reqCtx *policy.Requ
 					cost := int64(requestCost)
 					result, err := q.Limiter.AllowN(context.Background(), key, cost)
 					if err != nil {
-						if p.backend == "redis" && p.redisFailOpen {
+						if p.redisBacked() && p.redisFailOpen {
 							slog.Warn("Rate limit check failed (fail-open)", "error", err, "quota", quotaName)
 							continue
 						}
@@ -1590,7 +1651,7 @@ func (p *RateLimitPolicy) OnRequestBody(ctx context.Context, reqCtx *policy.Requ
 				// Use GetAvailable to check remaining without consuming tokens
 				available, err := q.Limiter.GetAvailable(context.Background(), key)
 				if err != nil {
-					if p.backend == "redis" && p.redisFailOpen {
+					if p.redisBacked() && p.redisFailOpen {
 						slog.Warn("Rate limit pre-check failed (fail-open)", "error", err, "key", key, "quota", quotaName)
 						continue
 					}
@@ -1638,7 +1699,7 @@ func (p *RateLimitPolicy) OnRequestBody(ctx context.Context, reqCtx *policy.Requ
 
 			result, err := q.Limiter.AllowN(context.Background(), key, cost)
 			if err != nil {
-				if p.backend == "redis" && p.redisFailOpen {
+				if p.redisBacked() && p.redisFailOpen {
 					slog.Warn("Rate limit check failed (fail-open)", "error", err, "quota", quotaName)
 					continue
 				}
@@ -1795,7 +1856,7 @@ func (p *RateLimitPolicy) OnResponseHeaders(ctx context.Context, respCtx *policy
 				result, err = q.Limiter.ConsumeOrClampN(context.Background(), key, int64(actualCost))
 			}
 			if err != nil {
-				if p.backend == "redis" && p.redisFailOpen {
+				if p.redisBacked() && p.redisFailOpen {
 					slog.Warn("Post-response rate limit check failed (fail-open)",
 						"error", err, "key", key, "cost", actualCost, "quota", quotaName)
 					continue
@@ -2011,7 +2072,7 @@ func (p *RateLimitPolicy) OnResponseBody(ctx context.Context, respCtx *policy.Re
 					result, err = q.Limiter.ConsumeOrClampN(context.Background(), key, int64(actualCost))
 				}
 				if err != nil {
-					if p.backend == "redis" && p.redisFailOpen {
+					if p.redisBacked() && p.redisFailOpen {
 						slog.Warn("Post-response rate limit check failed (fail-open)",
 							"error", err, "key", key, "cost", actualCost, "quota", quotaName)
 						continue
@@ -2349,7 +2410,7 @@ func (p *RateLimitPolicy) finalizeAndConsumeStreamingCosts(
 		// CostTracker; it clamps the deduction to the available balance.
 		if tracker, ok := q.Limiter.(limiter.CostTracker); ok {
 			if _, err := tracker.ConsumeN(ctx, key, int64(actualCost)); err != nil {
-				if p.backend == "redis" && p.redisFailOpen {
+				if p.redisBacked() && p.redisFailOpen {
 					slog.Warn("Streaming EOS cost consumption failed (fail-open)",
 						"error", err, "quota", quotaName, "key", key, "cost", actualCost)
 					continue
@@ -2360,7 +2421,7 @@ func (p *RateLimitPolicy) finalizeAndConsumeStreamingCosts(
 			}
 		} else {
 			if _, err := q.Limiter.ConsumeOrClampN(ctx, key, int64(actualCost)); err != nil {
-				if p.backend == "redis" && p.redisFailOpen {
+				if p.redisBacked() && p.redisFailOpen {
 					slog.Warn("Streaming EOS cost consumption failed (fail-open)",
 						"error", err, "quota", quotaName, "key", key, "cost", actualCost)
 					continue
