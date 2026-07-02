@@ -67,7 +67,7 @@ systemParameters:
 
     redis:
       type: object
-      description: Redis configuration (only used when backend=redis)
+      description: Redis configuration (used when backend=redis or backend=redis-local-async)
       additionalProperties: false
       properties:
         host:
