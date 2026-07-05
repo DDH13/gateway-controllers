@@ -1018,40 +1018,34 @@ func normalizeClaims(claims map[string]interface{}) map[string]interface{} {
 	return claims
 }
 
-// TestJWTAuthPolicy_Security_HMACConfusionRejected verifies the HMAC-confusion attack is blocked.
-// An attacker mints an HS256 token whose "secret" is the RSA public key bytes. The policy must
-// reject it because HS256 is not in the supported algorithm set.
+// TestJWTAuthPolicy_Security_HMACConfusionRejected verifies that HS256 tokens are rejected
+// because HS256 is not in the hardcoded supported algorithm set.
 func TestJWTAuthPolicy_Security_HMACConfusionRejected(t *testing.T) {
 	resetJWTAuthSingletonCache(t)
 
-	privateKey, publicKey := generateTestKeys(t)
+	_, publicKey := generateTestKeys(t)
 	jwksServer := createJWKSServer(t, publicKey, "test-kid")
 	defer jwksServer.Close()
 
-	// Encode the RSA public key as DER bytes and use that as the HMAC secret.
 	pubDER, err := x509.MarshalPKIXPublicKey(publicKey)
 	if err != nil {
 		t.Fatalf("failed to marshal public key: %v", err)
 	}
 
 	claims := normalizeClaims(map[string]interface{}{
-		"sub": "attacker",
+		"sub": "user-123",
 		"iss": "https://issuer.example.com",
 	})
 	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims(claims))
 	tok.Header["kid"] = "test-kid"
 	tokenString, err := tok.SignedString(pubDER)
 	if err != nil {
-		t.Fatalf("failed to sign HMAC-confusion token: %v", err)
+		t.Fatalf("failed to sign HS256 token: %v", err)
 	}
 
-	// Must be rejected: HS256 is not in the hardcoded supported set.
 	params := newRemoteParams(jwksServer.URL + "/jwks.json")
 	ctx, action := executeOnRequestHeaders(t, params, authHeader("Authorization", "Bearer", tokenString))
 	assertAuthFailure(t, ctx, action, 401)
-
-	// Sanity-check: a legitimately RS256-signed token still passes.
-	_ = privateKey // referenced to avoid unused-import warnings
 }
 
 // TestJWTAuthPolicy_Security_PS256Accepted verifies that PS256 (RSASSA-PSS) tokens are accepted
@@ -1176,35 +1170,29 @@ func TestJWTAuthPolicy_Security_ES256WithRSAKeyRejected(t *testing.T) {
 
 // TestJWTAuthPolicy_Security_UnsupportedAlgRejected verifies that algorithms outside the fixed
 // set (RS256, PS256, ES256) are rejected by WithValidMethods before the Keyfunc is reached.
+// RS384 is used: the JWKS key material matches the token's key, so the only reason for
+// rejection is that RS384 is not in supportedAlgorithms.
 func TestJWTAuthPolicy_Security_UnsupportedAlgRejected(t *testing.T) {
 	resetJWTAuthSingletonCache(t)
 
-	ecPriv, ecPub := generateTestECKeys(t)
-	jwksServer := createECJWKSServer(t, ecPub, "ec-kid")
+	privateKey, publicKey := generateTestKeys(t)
+	jwksServer := createJWKSServer(t, publicKey, "test-kid")
 	defer jwksServer.Close()
 
-	// ES384 is not in the hardcoded set; WithValidMethods should reject it.
 	claims := normalizeClaims(map[string]interface{}{
 		"sub": "user-123",
 		"iss": "https://issuer.example.com",
 	})
-	tok := jwt.NewWithClaims(jwt.SigningMethodES384, jwt.MapClaims(claims))
-	tok.Header["kid"] = "ec-kid"
-	// ES384 key must be P-384; using P-256 key will fail signing, so generate a P-384 key.
-	p384Priv, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	tok := jwt.NewWithClaims(jwt.SigningMethodRS384, jwt.MapClaims(claims))
+	tok.Header["kid"] = "test-kid"
+	tokenString, err := tok.SignedString(privateKey)
 	if err != nil {
-		t.Fatalf("failed to generate P-384 key: %v", err)
-	}
-	tokenString, err := tok.SignedString(p384Priv)
-	if err != nil {
-		t.Fatalf("failed to sign ES384 token: %v", err)
+		t.Fatalf("failed to sign RS384 token: %v", err)
 	}
 
 	params := newRemoteParams(jwksServer.URL + "/jwks.json")
 	ctx, action := executeOnRequestHeaders(t, params, authHeader("Authorization", "Bearer", tokenString))
 	assertAuthFailure(t, ctx, action, 401)
-
-	_ = ecPriv // used for JWKS server
 }
 
 func writeJWKSResponse(t *testing.T, w http.ResponseWriter, publicKey *rsa.PublicKey, kid string) {
