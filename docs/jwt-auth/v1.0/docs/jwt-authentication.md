@@ -104,8 +104,8 @@ skipTlsVerify = false
 | `headerName` | string | No | Header name to extract the token from (e.g., `"Authorization"`). Overrides `system.headerName`. Must be a valid HTTP header field name (non-empty, no spaces or control characters). |
 | `userIdClaim` | string | No | Claim name to extract user ID for analytics. Defaults to `sub`. |
 | `forwardToken` | boolean | No | If `true` (default), the JWT is forwarded to the upstream after successful validation. Set to `false` to strip the token header before proxying. |
-| `forwardedTokenHeader` | string | No | Header name used to forward the JWT to the upstream when `forwardToken` is `true`. Defaults to `x-forwarded-authorization`. If this differs from `headerName`, the original header is removed and the token is forwarded under this name instead. By default the full header value (including the scheme prefix) is forwarded; set `forwardTokenValue` to `true` to forward only the bare token value. Has no effect when `forwardToken` is `false`. |
-| `forwardTokenValue` | boolean | No | Controls what is forwarded under `forwardedTokenHeader` when `forwardToken` is `true`. If `true`, only the bare token value (with the scheme prefix such as `Bearer` stripped) is forwarded. If `false` (default), the full header value including the prefix is forwarded. Has no effect when `forwardToken` is `false`. |
+| `forwardedTokenHeader` | string | No | Header name used to forward the JWT to the upstream when `forwardToken` is `true`. Defaults to `x-forwarded-authorization`. If this differs from `headerName`, the original header is removed and the token is forwarded under this name instead. By default the full header value (including the scheme prefix) is forwarded; set `forwardTokenStripScheme` to `true` to forward only the bare token value. Has no effect when `forwardToken` is `false`. |
+| `forwardTokenStripScheme` | boolean | No | Controls what is forwarded under `forwardedTokenHeader` when `forwardToken` is `true`. If `true`, only the bare token value (with the scheme prefix such as `Bearer` stripped) is forwarded. If `false` (default), the full header value including the prefix is forwarded. Has no effect when `forwardToken` is `false`. |
 
 
 **Note:**
@@ -319,7 +319,7 @@ spec:
 
 ### Example 8: Forward the Token Value Without the Scheme Prefix
 
-Some upstreams expect the raw token value without the `Bearer` (or other) scheme prefix. Set `forwardTokenValue: true` to forward the bare token under `forwardedTokenHeader` instead of the full header value. For example, an incoming `Authorization: Bearer eyJ...` results in the upstream receiving `X-JWT-Token: eyJ...`.
+Some upstreams expect the raw token value without the `Bearer` (or other) scheme prefix. Set `forwardTokenStripScheme: true` to forward the bare token under `forwardedTokenHeader` instead of the full header value. For example, an incoming `Authorization: Bearer eyJ...` results in the upstream receiving `X-JWT-Token: eyJ...`.
 
 ```yaml
 apiVersion: gateway.api-platform.wso2.com/v1alpha1
@@ -343,6 +343,6 @@ spec:
             issuers:
               - PrimaryIDP
             forwardToken: true
-            forwardTokenValue: true
+            forwardTokenStripScheme: true
             forwardedTokenHeader: X-JWT-Token
 ```

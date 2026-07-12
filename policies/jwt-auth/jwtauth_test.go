@@ -207,9 +207,9 @@ func TestJWTAuthPolicy_ForwardTokenFalse(t *testing.T) {
 	}
 }
 
-// TestJWTAuthPolicy_ForwardTokenValue verifies that when forwardTokenValue is true,
+// TestJWTAuthPolicy_ForwardTokenStripScheme verifies that when forwardTokenStripScheme is true,
 // the bare token value (scheme prefix stripped) is forwarded under forwardedTokenHeader.
-func TestJWTAuthPolicy_ForwardTokenValue(t *testing.T) {
+func TestJWTAuthPolicy_ForwardTokenStripScheme(t *testing.T) {
 	privateKey, publicKey := generateTestKeys(t)
 	jwksServer := createJWKSServer(t, publicKey, "test-kid")
 	defer jwksServer.Close()
@@ -231,7 +231,7 @@ func TestJWTAuthPolicy_ForwardTokenValue(t *testing.T) {
 		"errorMessageFormat":   "json",
 		"leeway":               "30s",
 		"allowedAlgorithms":    []interface{}{"RS256", "ES256"},
-		"forwardTokenValue":    true,
+		"forwardTokenStripScheme":    true,
 		"forwardedTokenHeader": "X-My-Token",
 		"keyManagers": []interface{}{
 			map[string]interface{}{
@@ -281,10 +281,10 @@ func TestJWTAuthPolicy_ForwardTokenValue(t *testing.T) {
 	}
 }
 
-// TestJWTAuthPolicy_ForwardTokenValueSameHeader verifies that when forwardTokenValue is
+// TestJWTAuthPolicy_ForwardTokenStripSchemeSameHeader verifies that when forwardTokenStripScheme is
 // true and the forwarded header equals the source header, the header is overwritten
 // in place with the prefix-stripped value (not removed).
-func TestJWTAuthPolicy_ForwardTokenValueSameHeader(t *testing.T) {
+func TestJWTAuthPolicy_ForwardTokenStripSchemeSameHeader(t *testing.T) {
 	privateKey, publicKey := generateTestKeys(t)
 	jwksServer := createJWKSServer(t, publicKey, "test-kid")
 	defer jwksServer.Close()
@@ -304,7 +304,7 @@ func TestJWTAuthPolicy_ForwardTokenValueSameHeader(t *testing.T) {
 		"authHeaderScheme":     "Bearer",
 		"leeway":               "30s",
 		"allowedAlgorithms":    []interface{}{"RS256", "ES256"},
-		"forwardTokenValue":    true,
+		"forwardTokenStripScheme":    true,
 		"forwardedTokenHeader": "Authorization",
 		"keyManagers": []interface{}{
 			map[string]interface{}{
@@ -342,9 +342,9 @@ func TestJWTAuthPolicy_ForwardTokenValueSameHeader(t *testing.T) {
 	}
 }
 
-// TestJWTAuthPolicy_ForwardTokenValueDefaultOff verifies that with forwardTokenValue
+// TestJWTAuthPolicy_ForwardTokenStripSchemeDefaultOff verifies that with forwardTokenStripScheme
 // unset (default false), the full header value (including prefix) is forwarded.
-func TestJWTAuthPolicy_ForwardTokenValueDefaultOff(t *testing.T) {
+func TestJWTAuthPolicy_ForwardTokenStripSchemeDefaultOff(t *testing.T) {
 	privateKey, publicKey := generateTestKeys(t)
 	jwksServer := createJWKSServer(t, publicKey, "test-kid")
 	defer jwksServer.Close()

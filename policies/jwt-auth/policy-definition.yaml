@@ -92,11 +92,11 @@ parameters:
         `forwardToken` is true. If this differs from `headerName`, the original
         header is removed and the token is forwarded under this name instead. By
         default the full Authorization header value (including the scheme prefix)
-        is forwarded; set `forwardTokenValue` to true to forward only the bare
+        is forwarded; set `forwardTokenStripScheme` to true to forward only the bare
         token value. Has no effect when `forwardToken` is false.
       default: x-forwarded-authorization
 
-    forwardTokenValue:
+    forwardTokenStripScheme:
       type: boolean
       x-wso2-policy-advanced-param: true
       description: >-
