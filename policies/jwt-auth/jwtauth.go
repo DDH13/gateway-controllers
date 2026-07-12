@@ -1374,6 +1374,7 @@ func (p *JwtAuthPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.Req
 	userAuthHeaderPrefix := getStringParam(params, "authHeaderPrefix", "")
 	forwardToken := getBoolParam(params, "forwardToken", true)
 	forwardedTokenHeader := getStringParam(params, "forwardedTokenHeader", "x-forwarded-authorization")
+	forwardTokenStripScheme := getBoolParam(params, "forwardTokenStripScheme", false)
 
 	slog.Debug("JWT Auth Policy: User configuration loaded",
 		"issuers", userIssuers,
@@ -1383,6 +1384,7 @@ func (p *JwtAuthPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.Req
 		"claimMappingsCount", len(userClaimMappings),
 		"userIdClaim", userIdClaim,
 		"authHeaderPrefix", userAuthHeaderPrefix,
+		"forwardTokenStripScheme", forwardTokenStripScheme,
 	)
 
 	if userAuthHeaderPrefix != "" {
@@ -1523,12 +1525,14 @@ func (p *JwtAuthPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.Req
 
 	slog.Debug("JWT Auth Policy: All validations passed, authentication successful")
 
-	return p.handleAuthSuccessHeaders(reqCtx.SharedContext, claims, userClaimMappings, userIdClaim, headerName, authHeader, forwardToken, forwardedTokenHeader)
+	return p.handleAuthSuccessHeaders(reqCtx.SharedContext, claims, userClaimMappings, userIdClaim, headerName, authHeader, token,
+		forwardToken, forwardedTokenHeader, forwardTokenStripScheme)
 }
 
 // handleAuthSuccessHeaders handles successful JWT authentication in the header phase.
 func (p *JwtAuthPolicy) handleAuthSuccessHeaders(shared *policy.SharedContext, claims jwt.MapClaims, claimMappings map[string]string,
-	userIdClaim string, headerName string, authHeaderValue string, forwardToken bool, forwardedTokenHeader string) policy.RequestHeaderAction {
+	userIdClaim string, headerName string, authHeaderValue string, tokenValue string, forwardToken bool, forwardedTokenHeader string,
+	forwardTokenStripScheme bool) policy.RequestHeaderAction {
 	sub, _ := claims["sub"].(string)
 	iss, _ := claims["iss"].(string)
 	jti, _ := claims["jti"].(string)
@@ -1566,9 +1570,20 @@ func (p *JwtAuthPolicy) handleAuthSuccessHeaders(shared *policy.SharedContext, c
 
 	if !forwardToken {
 		modifications.HeadersToRemove = []string{canonicalIn}
-	} else if canonicalOut != canonicalIn {
-		modifications.HeadersToSet[canonicalOut] = authHeaderValue
-		modifications.HeadersToRemove = []string{canonicalIn}
+	} else {
+		// Forward either the bare token or the full
+		// original header value, depending on forwardTokenStripScheme.
+		forwardValue := authHeaderValue
+		if forwardTokenStripScheme {
+			forwardValue = tokenValue
+		}
+		if canonicalOut != canonicalIn {
+			modifications.HeadersToSet[canonicalOut] = forwardValue
+			modifications.HeadersToRemove = []string{canonicalIn}
+		} else if forwardTokenStripScheme {
+			// Same header name, but the prefix must be stripped, so overwrite it.
+			modifications.HeadersToSet[canonicalOut] = forwardValue
+		}
 	}
 
 	for claimName, headerName := range claimMappings {
