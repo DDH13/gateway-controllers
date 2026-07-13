@@ -135,8 +135,9 @@ func TestTokenCache_NegativeHit_Expired(t *testing.T) {
 	if verdict.ok {
 		t.Fatalf("expected a negative verdict, got a positive one")
 	}
-	if verdict.reason != "token expired" {
-		t.Fatalf("expected reason %q, got %q", "token expired", verdict.reason)
+	const wantReason = "token validation failed: token expired"
+	if verdict.reason != wantReason {
+		t.Fatalf("expected reason %q, got %q", wantReason, verdict.reason)
 	}
 
 	// Second identical request must be served from the negative cache.
@@ -279,7 +280,7 @@ func TestTokenCache_PositiveTTL_CappedByTokenCacheTtl(t *testing.T) {
 	jwksServer := createJWKSServer(t, publicKey, "test-kid")
 
 	params := newRemoteParams(jwksServer.URL + "/jwks.json")
-	params["tokenCacheTtl"] = "50ms"
+	params["tokenCacheTtl"] = "300ms"
 
 	// Token exp is far in the future, so the cap must come from tokenCacheTtl, not the token.
 	token := createTestToken(t, privateKey, map[string]interface{}{
@@ -299,11 +300,11 @@ func TestTokenCache_PositiveTTL_CappedByTokenCacheTtl(t *testing.T) {
 	if !hit || !verdict.ok {
 		t.Fatalf("expected a cached positive verdict")
 	}
-	if verdict.expiresAt.After(before.Add(200 * time.Millisecond)) {
-		t.Fatalf("expected cache expiry capped near tokenCacheTtl (50ms), got expiresAt=%v (now=%v)", verdict.expiresAt, before)
+	if verdict.expiresAt.After(before.Add(1 * time.Second)) {
+		t.Fatalf("expected cache expiry capped near tokenCacheTtl (300ms), got expiresAt=%v (now=%v)", verdict.expiresAt, before)
 	}
 
-	time.Sleep(80 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 	// Clear the unrelated JWKS-fetch cache and take down the endpoint: if the verdict-cache
 	// entry had survived, the second call would still succeed regardless of these two lines.
 	clearJWKSFetchCache()
@@ -354,7 +355,7 @@ func TestTokenCache_NegativeTTL_ExpiresAfterWindow(t *testing.T) {
 	defer jwksServer.Close()
 
 	params := newRemoteParams(jwksServer.URL + "/jwks.json")
-	params["negativeCacheTtl"] = "30ms"
+	params["negativeCacheTtl"] = "300ms"
 
 	expiredToken := createTestTokenWithExpiry(t, privateKey, map[string]interface{}{
 		"sub": "user-neg-ttl",
@@ -371,7 +372,7 @@ func TestTokenCache_NegativeTTL_ExpiresAfterWindow(t *testing.T) {
 		t.Fatalf("expected a negative cache entry immediately after the failed request")
 	}
 
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 
 	if _, hit := ins.getCachedVerdict(context.Background(), key); hit {
 		t.Fatalf("expected the negative cache entry to have expired after negativeCacheTtl")

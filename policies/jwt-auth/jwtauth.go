@@ -1653,10 +1653,11 @@ func (p *JwtAuthPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.Req
 		slog.Debug("JWT Auth Policy: Token validation failed",
 			"error", err,
 		)
+		failureReason := fmt.Sprintf("token validation failed: %v", err)
 		if tokenCaching && errors.Is(err, errTokenExpired) {
-			p.putVerdict(ctx, cacheKey, cachedVerdict{ok: false, reason: "token expired", expiresAt: time.Now().Add(negativeCacheTtl)})
+			p.putVerdict(ctx, cacheKey, cachedVerdict{ok: false, reason: failureReason, expiresAt: time.Now().Add(negativeCacheTtl)})
 		}
-		return p.handleAuthFailureHeaders(reqCtx.SharedContext, onFailureStatusCode, errorMessageFormat, errorMessage, fmt.Sprintf("token validation failed: %v", err))
+		return p.handleAuthFailureHeaders(reqCtx.SharedContext, onFailureStatusCode, errorMessageFormat, errorMessage, failureReason)
 	}
 
 	slog.Debug("JWT Auth Policy: Token signature validated successfully")

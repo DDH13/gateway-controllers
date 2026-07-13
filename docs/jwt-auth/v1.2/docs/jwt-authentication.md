@@ -66,7 +66,7 @@ When `tokencaching` is enabled (the default), the policy caches the outcome of s
 
 - **Successful verifications** are cached for up to `tokencachettl`, but never longer than the token's own `exp` claim (minus `leeway`) — so a live cache entry is always still within the token's validity window. This bounds how long a revoked token may still be accepted after it was last verified.
 - **Deterministically invalid tokens** — expired or structurally malformed only — are also cached, for the shorter `negativecachettl`, so repeated bad tokens are rejected without re-verifying them each time. Transient failures (e.g. a JWKS endpoint outage, an unrecognized `kid` during key rotation) and not-yet-valid (`nbf`) tokens are never cached, since those may resolve on a later attempt.
-- The cache is a single pool shared across all APIs on the gateway, bounded by `cachemaxsize`; entries are keyed by the token together with the key manager configuration, issuer validation settings, and the API identity, so a configuration change or redeploy is never served a stale verdict.
+- The cache is a single pool shared across all APIs on the gateway, bounded by `cachemaxsize`; entries are keyed by the token together with the key manager configuration, issuer validation settings, the configured `issuers` list, `leeway`, and the API identity, so a configuration change or redeploy is never served a stale verdict.
 - Set `tokencaching` to `false` to force full verification on every request — useful when debugging or when token validity must be checked against live state on every call.
 
 #### Sample System Configuration
