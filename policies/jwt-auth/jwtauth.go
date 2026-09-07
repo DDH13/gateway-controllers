@@ -140,12 +140,26 @@ type CachedJWKS struct {
 }
 
 // cachedVerdict stores the outcome of a signature verification, keyed by a hash of the
-// verification config and the raw token (see buildTokenCacheKey). ok=true is a successful
-// verification (claims holds the verified claim set); ok=false is a deterministic, permanently
-// invalid failure (expired or malformed token only — see errTokenExpired) that is safe to
-// short-circuit on repeat presentation. expiresAt is enforced on read (see getCachedVerdict)
-// since the SDK cache itself is created with ttl=0.
-
+// verification config and the raw token (see buildTokenCacheKey). Since the cache key carries no
+// API identity, one entry is shared across every API and route that sees the same token under the
+// same verification config — ok=true is a successful verification (claims holds the verified
+// claim set); ok=false is a deterministic, permanently invalid failure (expired or malformed
+// token only — see errTokenExpired) that is safe to short-circuit on repeat presentation.
+// expiresAt is enforced on read (see getCachedVerdict) since the SDK cache itself is created with
+// ttl=0.
+//
+// claims is stored and handed out by reference and read concurrently by every API sharing the
+// entry: nothing may mutate it in place. Every current reader (buildProperties, buildTypedProperties,
+// parseAudience) allocates fresh output rather than mutating claims, and a defensive copy on read
+// would spend exactly what the cache saves, so this invariant is enforced by convention, not by
+// the type system — a future change that mutates claims in place would corrupt every other API's
+// cached view. buildTypedProperties additionally deep-copies every nested []interface{}/
+// map[string]interface{} claim value (see deepCopyClaimValue) before handing it out via
+// AuthContext.TypedProperties: those values would otherwise escape to arbitrary downstream
+// policies still aliased to the shared claims map, so a policy that mutated one in place would
+// corrupt every other API's cached view too — and with apiId gone from the cache key, that is a
+// concurrent map/slice write across APIs, not a single-API bug.
+//
 // scopes contains resolved token scopes, cached with claims so both cache-hit and cache-miss paths enforce
 // scopes and populate AuthContext.Scopes consistently without re-running verification.
 type cachedVerdict struct {
@@ -293,11 +307,6 @@ func (p *JwtAuthPolicy) putVerdict(ctx context.Context, key string, verdict cach
 	_ = tc.Set(ctx, cache.CacheKey{Key: key}, verdict)
 }
 
-// buildTokenCacheKey returns a cache key that is a complete function of the verification
-// verdict: fingerprint folds in everything that determines the verdict but is not part of the
-// token itself (API identity plus verification config), and the token supplies the rest. The
-// token is hashed (never stored or logged raw) to keep the bearer secret out of cache keys and
-// bound key length.
 // configHasher accumulates a canonical byte encoding of the verification config in a reusable
 // buffer, which is then hashed in one pass. Writing into a plain []byte rather than straight
 // into a hash.Hash matters: hash.Hash is an interface, so every small Write forces its argument
@@ -317,7 +326,20 @@ func newConfigHasher() *configHasher {
 	return c
 }
 
-func (c *configHasher) release() { configHasherPool.Put(c) }
+// release returns the hasher to the pool after zeroing exactly the bytes this call wrote
+// (c.buf[:len(c.buf)], not the full backing array): buildTokenCacheKey stages the raw bearer
+// token in this buffer, and without this the token would sit untouched in pooled heap memory
+// past its logical length — reachable via cap(c.buf) — until the pool's backing array happened
+// to be overwritten or GC'd, and visible in any heap or core dump taken in the meantime. Bounding
+// the zeroing to len(c.buf) instead of cap(c.buf) keeps the cost proportional to what this call
+// actually wrote rather than to however much capacity previous, unrelated calls grew the buffer
+// to, since every call already zeroes what it wrote by the time it releases.
+func (c *configHasher) release() {
+	for i := range c.buf {
+		c.buf[i] = 0
+	}
+	configHasherPool.Put(c)
+}
 
 // sum returns the digest of everything written so far, as a fixed-size binary string.
 func (c *configHasher) sum() string {
@@ -401,9 +423,12 @@ func (c *configHasher) value(v interface{}) {
 
 // buildTokenCacheKey returns a cache key that is a complete function of the verification
 // verdict: fingerprint folds in everything that determines the verdict but is not part of the
-// token itself (API identity plus verification config), and the token supplies the rest. The
-// token is hashed (never stored or logged raw) to keep the bearer secret out of cache keys and
-// bound key length.
+// token itself (verification config only — see tokenConfigFingerprint), and the token supplies
+// the rest. The token is hashed (never logged raw, and not stored beyond this call) to keep the
+// bearer secret out of cache keys and bound key length: it is staged in the hasher's pooled
+// buffer only for the duration of this call, and release() zeroes exactly what was staged before
+// the buffer returns to the pool, so the token does not persist in that pooled heap memory for a
+// future caller (or a heap/core dump) to read.
 func buildTokenCacheKey(fingerprint, token string) string {
 	c := newConfigHasher()
 	defer c.release()
@@ -415,23 +440,29 @@ func buildTokenCacheKey(fingerprint, token string) string {
 }
 
 // tokenConfigFingerprint renders the token-shaping/verification configuration as a deterministic
-// string. apiId/apiName isolate the shared singleton cache per API even when two APIs would
-// otherwise see identical tokens. keyManagersRaw is hashed as configured (not the
-// parsed/expensive form), so computing the fingerprint never requires cert/TLS parsing — that
-// parsing happens only on a cache miss. A redeploy that changes any of these fields yields a
-// different fingerprint (a cache miss), so a token is never trusted under stale config.
-func tokenConfigFingerprint(apiId, apiName string, keyManagersRaw interface{}, validateIssuer bool, issuers []string, leeway time.Duration) string {
-	return tokenConfigFingerprintFromDigest(apiId, apiName,
-		keyManagersConfigDigest(keyManagersRaw), validateIssuer, issuers, leeway)
+// string. The invariant is that the fingerprint folds in everything that determines the
+// signature-verification verdict and nothing that does not: API identity determines nothing (the
+// same key material and issuer-selection rules verify a token identically regardless of which API
+// presented it), so it is deliberately excluded — that is what lets one verification serve every
+// API a token is presented to. keyManagersRaw is hashed as configured (not the parsed/expensive
+// form), so computing the fingerprint never requires cert/TLS parsing — that parsing happens only
+// on a cache miss. tokenCacheTtl and negativeCacheTtl are folded in too even though they play no
+// part in the verdict itself: a cached verdict's expiresAt is set from the *writing* route's TTLs
+// (see OnRequestHeaders), so two routes configured with different TTLs must never share a cache
+// entry — otherwise whichever route wrote the entry silently dictates how long every other route
+// trusts it, defeating the TTL as a per-route bound on stale-verdict/revocation exposure. A
+// redeploy that changes any of these fields yields a different fingerprint (a cache miss), so a
+// token is never trusted under stale config.
+func tokenConfigFingerprint(keyManagersRaw interface{}, validateIssuer bool, issuers []string, leeway, tokenCacheTtl, negativeCacheTtl time.Duration) string {
+	return tokenConfigFingerprintFromDigest(
+		keyManagersConfigDigest(keyManagersRaw), validateIssuer, issuers, leeway, tokenCacheTtl, negativeCacheTtl)
 }
 
 // tokenConfigFingerprintFromDigest is tokenConfigFingerprint with the key-manager config already
 // reduced to a digest, so the request path can walk that config once and reuse the result.
-func tokenConfigFingerprintFromDigest(apiId, apiName, kmDigest string, validateIssuer bool, issuers []string, leeway time.Duration) string {
+func tokenConfigFingerprintFromDigest(kmDigest string, validateIssuer bool, issuers []string, leeway, tokenCacheTtl, negativeCacheTtl time.Duration) string {
 	c := newConfigHasher()
 	defer c.release()
-	c.field(apiId)
-	c.field(apiName)
 	c.field(kmDigest)
 	c.boolean(validateIssuer)
 	c.uint(uint64(len(issuers)))
@@ -439,6 +470,8 @@ func tokenConfigFingerprintFromDigest(apiId, apiName, kmDigest string, validateI
 		c.field(iss)
 	}
 	c.uint(uint64(leeway))
+	c.uint(uint64(tokenCacheTtl))
+	c.uint(uint64(negativeCacheTtl))
 	return c.sum()
 }
 
@@ -1572,6 +1605,70 @@ func resolveClaimConstraints(params map[string]interface{}) (ClaimConstraints, e
 	return ClaimConstraints{}, nil
 }
 
+// resolveScopeConstraintsCache memoizes resolveScopeConstraints by a digest of the raw "scopes"
+// and "requiredScopes" param values — the only two inputs that determine its result — following
+// the parsedPublicKeys pattern (see parsePublicKeyFromString). params is re-decoded from the same
+// route config on every request, so identical raw values always parse to the same constraints,
+// and a redeploy that changes either field yields a different digest (a cache miss). The error
+// case is cached too: malformed constraints deny the request, and would otherwise re-parse on
+// every request under a bad deploy. Entries are config-lifetime and unbounded in practice by the
+// number of distinct scopes/requiredScopes configurations an operator deploys. Cleared by
+// resetJWTAuthSingletonCache for test isolation.
+var resolveScopeConstraintsCache sync.Map // digest -> resolvedScopeConstraints
+
+type resolvedScopeConstraints struct {
+	constraints ScopeConstraints
+	err         error
+}
+
+func resolveScopeConstraintsCached(params map[string]interface{}) (ScopeConstraints, error) {
+	digest := scopeConstraintsConfigDigest(params)
+	if cached, ok := resolveScopeConstraintsCache.Load(digest); ok {
+		entry := cached.(resolvedScopeConstraints)
+		return entry.constraints, entry.err
+	}
+	constraints, err := resolveScopeConstraints(params)
+	resolveScopeConstraintsCache.Store(digest, resolvedScopeConstraints{constraints: constraints, err: err})
+	return constraints, err
+}
+
+func scopeConstraintsConfigDigest(params map[string]interface{}) string {
+	c := newConfigHasher()
+	defer c.release()
+	c.value(params["scopes"])
+	c.value(params["requiredScopes"])
+	return c.sum()
+}
+
+// resolveClaimConstraintsCache is resolveScopeConstraintsCache's counterpart, memoizing
+// resolveClaimConstraints by a digest of "claims" and "requiredClaims". Same growth and
+// test-isolation story as resolveScopeConstraintsCache above.
+var resolveClaimConstraintsCache sync.Map // digest -> resolvedClaimConstraints
+
+type resolvedClaimConstraints struct {
+	constraints ClaimConstraints
+	err         error
+}
+
+func resolveClaimConstraintsCached(params map[string]interface{}) (ClaimConstraints, error) {
+	digest := claimConstraintsConfigDigest(params)
+	if cached, ok := resolveClaimConstraintsCache.Load(digest); ok {
+		entry := cached.(resolvedClaimConstraints)
+		return entry.constraints, entry.err
+	}
+	constraints, err := resolveClaimConstraints(params)
+	resolveClaimConstraintsCache.Store(digest, resolvedClaimConstraints{constraints: constraints, err: err})
+	return constraints, err
+}
+
+func claimConstraintsConfigDigest(params map[string]interface{}) string {
+	c := newConfigHasher()
+	defer c.release()
+	c.value(params["claims"])
+	c.value(params["requiredClaims"])
+	return c.sum()
+}
+
 // claimValuesAsStrings renders a token claim value as a slice of strings: a scalar becomes one
 // element, an array becomes many. Uses claimValueToString so numeric/bool claims stringify
 // consistently with how they are surfaced elsewhere. Blank results are dropped.
@@ -1702,7 +1799,11 @@ func buildProperties(claims jwt.MapClaims) map[string]string {
 // buildTypedProperties extracts non-standard claims into a map[string]interface{}, preserving each
 // claim's native type (string, []interface{}, map[string]interface{}, etc.) so downstream policies
 // (e.g. mcp-authz) can match array-valued claims as sets or process structured data. Unlike
-// buildProperties, it does not flatten values into a serialized string.
+// buildProperties, it does not flatten values into a serialized string. The top-level map is
+// always fresh, but a []interface{}/map[string]interface{} claim value is deep-copied (see
+// deepCopyClaimValue) before being placed in it, since it would otherwise still be the same
+// mutable value shared by the cached verdict every other API sees (see the claims invariant on
+// cachedVerdict above).
 func buildTypedProperties(claims jwt.MapClaims) map[string]interface{} {
 	var out map[string]interface{}
 	for k, v := range claims {
@@ -1715,9 +1816,34 @@ func buildTypedProperties(claims jwt.MapClaims) map[string]interface{} {
 		if out == nil {
 			out = make(map[string]interface{})
 		}
-		out[k] = v
+		out[k] = deepCopyClaimValue(v)
 	}
 	return out
+}
+
+// deepCopyClaimValue returns a copy of a claim value safe to hand to a caller outside the shared
+// cached verdict. Claim values ultimately come from unmarshaling the token's JSON, so v is built
+// only from the types encoding/json produces: nil, bool, string, float64, []interface{}, and
+// map[string]interface{}. Scalars are immutable in Go and safe to alias as-is; only the two
+// mutable container types need copying, recursively, so a caller that mutates a nested slice or
+// map in place cannot reach back into (and corrupt) the cached claims every other API shares.
+func deepCopyClaimValue(v interface{}) interface{} {
+	switch val := v.(type) {
+	case []interface{}:
+		out := make([]interface{}, len(val))
+		for i, item := range val {
+			out[i] = deepCopyClaimValue(item)
+		}
+		return out
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(val))
+		for k, item := range val {
+			out[k] = deepCopyClaimValue(item)
+		}
+		return out
+	default:
+		return val
+	}
 }
 
 // Helper functions for type assertions
@@ -1908,7 +2034,8 @@ func loadPublicKeyFromCertificate(certPath string) (crypto.PublicKey, error) {
 // stale, and a changed certificate is a different key. Without this, every verdict-cache miss
 // re-parsed every configured key manager's certificate; with tokenCaching disabled that was
 // every request. Entries are config-lifetime and unbounded, bounded in practice by the number
-// of distinct certificates an operator configures.
+// of distinct certificates an operator configures. Cleared by resetJWTAuthSingletonCache for
+// test isolation.
 var parsedPublicKeys sync.Map // PEM string -> parsedPublicKey
 
 type parsedPublicKey struct {
@@ -2126,12 +2253,12 @@ func (p *JwtAuthPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.Req
 	userAudiences := getStringArrayParam(params, "audiences", []string{})
 	// scopes/claims (new) take precedence over requiredScopes/requiredClaims (deprecated). A
 	// malformed new param denies the request rather than silently dropping a security constraint.
-	scopeConstraints, scopeErr := resolveScopeConstraints(params)
+	scopeConstraints, scopeErr := resolveScopeConstraintsCached(params)
 	if scopeErr != nil {
 		slog.Warn("JWT Auth Policy: invalid 'scopes' configuration; denying request", "error", scopeErr)
 		return p.handleAuthFailureHeaders(reqCtx.SharedContext, onFailureStatusCode, errorMessageFormat, errorMessage, "invalid scopes configuration")
 	}
-	claimConstraints, claimErr := resolveClaimConstraints(params)
+	claimConstraints, claimErr := resolveClaimConstraintsCached(params)
 	if claimErr != nil {
 		slog.Warn("JWT Auth Policy: invalid 'claims' configuration; denying request", "error", claimErr)
 		return p.handleAuthFailureHeaders(reqCtx.SharedContext, onFailureStatusCode, errorMessageFormat, errorMessage, "invalid claims configuration")
@@ -2206,10 +2333,9 @@ func (p *JwtAuthPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.Req
 	// exactly what the verdict cache exists to skip on a repeat presentation of the same token
 	// under the same verification config (see tokenConfigFingerprint).
 	var cacheKey string
-	var kmDigest string
 	if tokenCaching {
-		kmDigest = keyManagersConfigDigest(keyManagersRaw)
-		fingerprint := tokenConfigFingerprintFromDigest(reqCtx.APIId, reqCtx.APIName, kmDigest, validateIssuer, userIssuers, leeway)
+		kmDigest := keyManagersConfigDigest(keyManagersRaw)
+		fingerprint := tokenConfigFingerprintFromDigest(kmDigest, validateIssuer, userIssuers, leeway, tokenCacheTtl, negativeCacheTtl)
 		cacheKey = buildTokenCacheKey(fingerprint, token)
 		if verdict, hit := p.getCachedVerdict(ctx, cacheKey); hit {
 			if verdict.ok {
