@@ -309,10 +309,11 @@ systemParameters:
         Maximum total number of cached verification verdicts (successful and failed, combined)
         to hold across all APIs (a single global bound, not per-API). Entries themselves are
         shared across APIs when their verification config (key managers, issuer validation,
-        issuers, leeway) matches, so a token presented to many APIs occupies one entry, not one
-        per API, stretching this budget further. When the limit is reached, the cache evicts the
-        least-recently-used existing entries to make room. Changing this value rebuilds the
-        shared cache, which flushes all currently cached verdicts.
+        issuers, leeway, tokenCacheTtl, negativeCacheTtl) matches, so a token presented to many
+        APIs occupies one entry, not one per API, stretching this budget further. When the limit
+        is reached, the cache evicts the least-recently-used existing entries to make room.
+        Changing this value rebuilds the shared cache, which flushes all currently cached
+        verdicts.
       default: 100000
       minimum: 1
       "wso2/defaultValue": "${config.policy_configurations.jwtauth_v1.cachemaxsize}"

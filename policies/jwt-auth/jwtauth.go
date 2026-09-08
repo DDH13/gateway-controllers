@@ -2027,7 +2027,6 @@ func loadPublicKeyFromCertificate(certPath string) (crypto.PublicKey, error) {
 	return parsePublicKeyFromString(string(certData))
 }
 
-// parsePublicKeyFromString parses a public key (RSA or ECDSA) from a PEM-encoded string
 // parsedPublicKeys memoizes parsePublicKeyFromString by its PEM input. Parsing an inline
 // certificate is pure x509/ASN.1 work over a string that comes from the configuration itself,
 // so the result is fully determined by the key — there is no file to re-read and nothing to go
@@ -2043,6 +2042,8 @@ type parsedPublicKey struct {
 	err error
 }
 
+// parsePublicKeyFromString parses a public key (RSA or ECDSA) from a PEM-encoded string,
+// memoizing the result by that string (see parsedPublicKeys).
 func parsePublicKeyFromString(pemData string) (crypto.PublicKey, error) {
 	if cached, ok := parsedPublicKeys.Load(pemData); ok {
 		entry := cached.(parsedPublicKey)
@@ -2055,6 +2056,8 @@ func parsePublicKeyFromString(pemData string) (crypto.PublicKey, error) {
 	return key, err
 }
 
+// parsePublicKeyFromStringUncached does the actual PEM decode and x509 parsing that
+// parsePublicKeyFromString memoizes.
 func parsePublicKeyFromStringUncached(pemData string) (crypto.PublicKey, error) {
 	if debugEnabled() {
 		slog.Debug("JWT Auth Policy: parsePublicKeyFromString called",
